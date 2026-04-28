@@ -353,6 +353,102 @@ def build_webhook_contents(contents: str) -> str:
     return (contents or "").replace("\n", "\\n")
 
 
+_COLLAB_RE = re.compile(r'([가-힣]{2,})\s*[Xx×]\s*([가-힣]{2,})')
+
+
+def detect_collab_pair(event_name: str, main_title: str = "") -> str:
+    """이벤트명/메인타이틀에서 '브랜드A X 브랜드B' 콜라보 쌍을 추출해 정규화된 문자열로 반환.
+    감지되지 않으면 빈 문자열 반환.
+    """
+    for text in (event_name or "", main_title or ""):
+        m = _COLLAB_RE.search(text)
+        if m:
+            left  = m.group(1).strip()
+            right = m.group(2).strip()
+            if len(left) >= 2 and len(right) >= 2:
+                return f"{left} x {right}"
+    return ""
+
+
+def title_has_collab_pair(title: str, collab_pair: str) -> bool:
+    """title이 collab_pair의 두 브랜드명을 모두 포함하는지 확인."""
+    if not collab_pair:
+        return True
+    parts = [p.strip() for p in re.split(r'\s*[Xx×]\s*', collab_pair) if p.strip()]
+    title_flat = (title or "").replace(" ", "")
+    return all(p.replace(" ", "") in title_flat for p in parts)
+
+
+def extract_title_keywords(title: str, collab_pair: str = "") -> list:
+    """제목에서 3자 이상 토큰을 추출해 content 프롬프트의 금지 단어 목록으로 사용.
+    collab_pair가 있으면 개별 브랜드명도 추가한다.
+    """
+    tokens = re.split(r'[\s,·×xX\-]', title or "")
+    keywords = [t for t in tokens if len(t) >= 3]
+    if collab_pair:
+        for part in collab_pair.split(" X "):
+            part = part.strip()
+            if len(part) >= 2 and part not in keywords:
+                keywords.append(part)
+    seen = []
+    for k in keywords:
+        if k not in seen:
+            seen.append(k)
+    return seen
+
+
+def detect_content_nature(
+    event_name: str,
+    promotion_content: str,
+    main_title: str = "",
+    collab_pair: str = "",
+) -> str:
+    """소재 성격 분류: 콜라보레이션 / 단독선발매 / 신규발매 / 프로모션 / 기타.
+
+    collab_pair가 이미 감지된 경우 최우선으로 콜라보레이션 반환.
+    이후 키워드 우선순위: 단독선발매 > 신규발매 > 프로모션 > 기타.
+    """
+    if collab_pair:
+        return "콜라보레이션"
+
+    text = " ".join([event_name or "", promotion_content or "", main_title or ""]).lower()
+
+    if any(kw in text for kw in ["단독", "선발매", "선론칭"]):
+        return "단독선발매"
+
+    if any(kw in text for kw in ["신상", "드롭", "런칭", "발매", "출시",
+                                   "ss ", "fw ", "25ss", "26ss", "25fw", "26fw",
+                                   "컬렉션", "시즌", "new drop", "new arrival"]):
+        return "신규발매"
+
+    if any(kw in text for kw in ["%", "쿠폰", "할인", "세일", "특가", "혜택"]):
+        return "프로모션"
+
+    return "기타"
+
+
+def detect_benefit_type(
+    promotion_content: str,
+    event_name: str = "",
+) -> str:
+    """혜택 유형 분류: Edition / Gift / Price.
+
+    우선순위: Edition > Gift > Price. 해당 없으면 빈 문자열 반환.
+    """
+    text = " ".join([promotion_content or "", event_name or ""]).lower()
+
+    if any(kw in text for kw in ["한정판", "에디션", "단독 굿즈", "굿즈", "한정", "limited edition"]):
+        return "Edition"
+
+    if any(kw in text for kw in ["사은품", "키링", "기프트", "gift"]) or re.search(r'사은품\s*증정|키링\s*증정', text):
+        return "Gift"
+
+    if any(kw in text for kw in ["%", "쿠폰", "할인", "특가", "적립"]):
+        return "Price"
+
+    return ""
+
+
 def select_contents(
     v1_message: Optional[str],
     v2_message: Optional[str],

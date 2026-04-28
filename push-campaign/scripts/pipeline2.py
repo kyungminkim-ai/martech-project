@@ -3,16 +3,19 @@ import logging
 import pandas as pd
 from config import (
     CONFIDENCE_THRESHOLD, AD_CODE_SEED_FILE, AD_CODE_PREFIX,
-    CAMPAIGN_META_SYNC_PATH, DATA_DIR, get_pipeline2_checkpoint_path,
+    CAMPAIGN_META_SYNC_PATH, DATA_DIR, TITLE_MIN_LEN, TITLE_MAX_LEN,
+    get_pipeline2_checkpoint_path,
 )
 from rules import (
     classify_target, get_content_type, get_priority, get_category_id,
     is_title_valid, sanitize_title, generate_ad_code, build_push_url,
     append_unsubscribe, lookup_brand_name, build_category_list_str,
     build_braze_campaign_name, build_feed_url, build_webhook_contents,
-    select_contents, extract_goods_id,
+    extract_goods_id, extract_title_keywords,
+    detect_collab_pair, title_has_collab_pair,
+    detect_content_nature, detect_benefit_type,
 )
-from llm_client import regenerate_title, generate_v1, generate_v2, generate_v3, set_current_row, infer_category_ids
+from llm_client import regenerate_title, generate_content, set_current_row, infer_category_ids
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +33,6 @@ def _load_last_ad_code() -> str:
     """campaign_meta_sync.csv 최댓값과 seed 파일 중 더 큰 APSCMCD 코드를 반환."""
     candidates = []
 
-    # 1. campaign_meta_sync.csv에서 최댓값 (정식 소스)
     try:
         df = pd.read_csv(CAMPAIGN_META_SYNC_PATH, usecols=["ad_code"])
         codes = df["ad_code"].dropna()
@@ -40,7 +42,6 @@ def _load_last_ad_code() -> str:
     except Exception:
         pass
 
-    # 2. seed 파일 (동일 세션 내 이전 실행 결과)
     try:
         seed = AD_CODE_SEED_FILE.read_text().strip()
         if seed.startswith(AD_CODE_PREFIX):
@@ -67,6 +68,22 @@ def _merge_category_ids(base_cat: str, llm_cats: list) -> str:
     return ",".join(seen[:3])
 
 
+def _trim_long_title(original_title: str) -> str:
+    """40자 초과 제목에서 쉼표 앞 훅 문구 추출. 분리 불가 시 원본 반환 (LLM이 재생성).
+
+    예) "빵처럼 맛있는 쉐이크 발견, 테이크핏 브레드밀 단독 출시"
+        → "빵처럼 맛있는 쉐이크 발견" (15자 미만이면 원본 반환)
+    """
+    if len(original_title) <= TITLE_MAX_LEN:
+        return original_title
+    parts = original_title.split(",", 1)
+    if len(parts) > 1:
+        front = parts[0].strip()
+        if len(front) >= TITLE_MIN_LEN:
+            return front
+    return original_title
+
+
 def process_row(row: pd.Series, brand_df: pd.DataFrame, current_ad_code: str, category_df=None) -> dict:
     brand_id          = str(row.get("sourceBrandId", "") or "")
     promotion_content = str(row.get("promotion_content", "") or "")
@@ -78,7 +95,6 @@ def process_row(row: pd.Series, brand_df: pd.DataFrame, current_ad_code: str, ca
     send_dt           = str(row.get("send_dt", "") or "")
     remarks           = str(row.get("remarks", "") or "")
 
-    # 브랜드 한국어명 조회
     brand_name = lookup_brand_name(brand_id, brand_df)
 
     result = {}
@@ -90,7 +106,7 @@ def process_row(row: pd.Series, brand_df: pd.DataFrame, current_ad_code: str, ca
     merged_category_id = _merge_category_ids(base_cat, llm_cats)
 
     # ── Rule-based ──────────────────────────────────────────────────────
-    result["send_dt"]      = send_dt   # P1에서 각 행에 설정된 발송일 명시적 전달
+    result["send_dt"]      = send_dt
     result["send_time"]    = "11:00"
     result["target"]       = classify_target(team_name, brand_id=brand_id, brand_df=brand_df)
     result["priority"]     = get_priority(team_name, landing_url)
@@ -108,12 +124,31 @@ def process_row(row: pd.Series, brand_df: pd.DataFrame, current_ad_code: str, ca
     result["ad_code"]   = ad_code
     result["push_url"]  = build_push_url(landing_url, ad_code)
 
+    # ── 콜라보 감지 & 소재 성격/혜택 유형 분류 ───────────────────────────
+    collab_pair    = detect_collab_pair(event_name, original_title)
+    content_nature = detect_content_nature(event_name, promotion_content, original_title, collab_pair)
+    benefit_type   = detect_benefit_type(promotion_content, event_name)
+
+    result["content_nature"] = content_nature
+    result["benefit_type"]   = benefit_type
+
     # ── 제목 처리 ────────────────────────────────────────────────────────
-    if is_title_valid(original_title):
-        result["title"]        = original_title
+    # 1) 40자 초과 시 쉼표 앞 훅 부분 추출 시도
+    candidate_title = _trim_long_title(original_title)
+
+    # 2) 콜라보 소재는 제목에 "BrandA X BrandB" 쌍이 반드시 있어야 유효
+    _title_format_ok  = is_title_valid(candidate_title)
+    _title_collab_ok  = title_has_collab_pair(candidate_title, collab_pair)
+
+    if _title_format_ok and _title_collab_ok:
+        result["title"]        = candidate_title
         result["title_source"] = "original"
     else:
-        regen = regenerate_title(brand_name, promotion_content, result["target"], remarks=remarks)
+        regen = regenerate_title(
+            brand_name, promotion_content, result["target"],
+            remarks=remarks, collab_pair=collab_pair,
+            content_nature=content_nature, benefit_type=benefit_type,
+        )
         if regen:
             result["title"]        = regen
             result["title_source"] = "llm"
@@ -121,50 +156,22 @@ def process_row(row: pd.Series, brand_df: pd.DataFrame, current_ad_code: str, ca
             result["title"]        = original_title
             result["title_source"] = "fallback"
 
-    # ── V1 BENEFIT ───────────────────────────────────────────────────────
-    v1 = generate_v1(
+    # ── content 생성 (단일 호출) ─────────────────────────────────────────
+    title_keywords = extract_title_keywords(result["title"], collab_pair=collab_pair)
+    content_result = generate_content(
         title=result["title"],
         brand=brand_name,
         promotion_content=promotion_content,
         content_type=result["content_type"] or "",
         target=result["target"],
+        title_keywords=title_keywords,
+        collab_pair=collab_pair,
         remarks=remarks,
+        content_nature=content_nature,
+        benefit_type=benefit_type,
     )
-    result["contents_v1"]   = append_unsubscribe(v1["message"]) if v1["message"] else None
-    result["confidence_v1"] = v1["confidence"]
-
-    # ── V2 BRAND ─────────────────────────────────────────────────────────
-    v2 = generate_v2(
-        title=result["title"],
-        brand=brand_name,
-        promotion_content=promotion_content,
-        content_type=result["content_type"] or "",
-        target=result["target"],
-        remarks=remarks,
-    )
-    result["contents_v2"]   = append_unsubscribe(v2["message"]) if v2["message"] else None
-    result["confidence_v2"] = v2["confidence"]
-
-    # ── V3 BEST (V1+V2 합성 최선책) ──────────────────────────────────────
-    v3 = generate_v3(
-        title=result["title"],
-        brand=brand_name,
-        promotion_content=promotion_content,
-        content_type=result["content_type"] or "",
-        target=result["target"],
-        remarks=remarks,
-        v1_message=v1["message"] or "",
-        v2_message=v2["message"] or "",
-    )
-    result["contents_v3"]   = append_unsubscribe(v3["message"]) if v3["message"] else None
-    result["confidence_v3"] = v3["confidence"]
-
-    # ── 발송 본문 자동 선택 (V3 최선책 우선 → V1 → V2 기본) ─────────────
-    selected_msg, selected_src = select_contents(
-        result["contents_v1"], result["contents_v2"], result["contents_v3"]
-    )
-    result["contents"]         = selected_msg
-    result["contents_source"]  = selected_src
+    result["contents"]    = append_unsubscribe(content_result["message"]) if content_result["message"] else None
+    result["confidence"]  = content_result["confidence"]
 
     # ── 자동 생성 컬럼 ────────────────────────────────────────────────────
     result["braze_campaign_name"] = build_braze_campaign_name(
@@ -179,13 +186,9 @@ def process_row(row: pd.Series, brand_df: pd.DataFrame, current_ad_code: str, ca
     result["webhook_contents"] = build_webhook_contents(result["contents"] or "")
 
     # ── 검수 플래그 ──────────────────────────────────────────────────────
-    result["error_flag"] = (
-        result["contents_v1"] is None or result["contents_v2"] is None
-    )
+    result["error_flag"] = result["contents"] is None
     result["needs_review"] = result["error_flag"] or any([
-        (v1["confidence"] or 0) < CONFIDENCE_THRESHOLD,
-        (v2["confidence"] or 0) < CONFIDENCE_THRESHOLD,
-        (v3["confidence"] or 0) < CONFIDENCE_THRESHOLD,
+        (content_result["confidence"] or 0) < CONFIDENCE_THRESHOLD,
         result["title_source"] == "fallback",
     ])
 
@@ -198,11 +201,7 @@ _VALID_CONTENT_TYPES = {"캠페인", "콘텐츠", "브랜드", None}
 
 
 def _postprocess_columns(result: dict) -> dict:
-    """Pipeline 2 출력 컬럼을 정규화·보정한다.
-
-    각 컬럼의 허용 값 범위를 검증하고, 범위 외 값은 안전한 기본값으로 대체한다.
-    title은 sanitize_title을 재확인하여 제어문자가 남아있지 않도록 한다.
-    """
+    """Pipeline 2 출력 컬럼을 정규화·보정한다."""
     result["title"] = sanitize_title(result.get("title") or "")
 
     if result.get("send_time") not in ("11:00",):
@@ -228,7 +227,7 @@ def _postprocess_columns(result: dict) -> dict:
     return result
 
 
-_CHECKPOINT_INTERVAL = 5  # 몇 건마다 체크포인트 저장할지
+_CHECKPOINT_INTERVAL = 5
 
 
 def run_pipeline2(selected_df: pd.DataFrame, brand_df: pd.DataFrame, category_df=None, send_dt: str = None) -> pd.DataFrame:
@@ -238,7 +237,6 @@ def run_pipeline2(selected_df: pd.DataFrame, brand_df: pd.DataFrame, category_df
     rows: list = []
     total = len(selected_df)
 
-    # ── 체크포인트 로드 ──────────────────────────────────────────────────
     checkpoint_path = get_pipeline2_checkpoint_path(send_dt) if send_dt else None
     processed_ids: set = set()
 
@@ -271,7 +269,6 @@ def run_pipeline2(selected_df: pd.DataFrame, brand_df: pd.DataFrame, category_df
             logger.error(f"id={row_id} 처리 실패: {e}")
             rows.append({**row.to_dict(), "error_flag": True, "needs_review": True})
 
-        # ── 체크포인트 저장 ──────────────────────────────────────────────
         if checkpoint_path and len(rows) % _CHECKPOINT_INTERVAL == 0:
             try:
                 DATA_DIR.mkdir(parents=True, exist_ok=True)
@@ -283,20 +280,17 @@ def run_pipeline2(selected_df: pd.DataFrame, brand_df: pd.DataFrame, category_df
 
     result_df = pd.DataFrame(rows)
 
-    # ── 체크포인트 정리 ──────────────────────────────────────────────────
     if checkpoint_path and checkpoint_path.exists():
         try:
             checkpoint_path.unlink()
         except Exception:
             pass
 
-    v1_ok    = result_df["contents_v1"].notna().sum() if "contents_v1" in result_df.columns else 0
-    v2_ok    = result_df["contents_v2"].notna().sum() if "contents_v2" in result_df.columns else 0
-    errors   = int(result_df.get("error_flag", pd.Series([False] * len(result_df))).sum())
-    reviews  = int(result_df.get("needs_review", pd.Series([False] * len(result_df))).sum())
+    content_ok = result_df["contents"].notna().sum() if "contents" in result_df.columns else 0
+    errors  = int(result_df.get("error_flag", pd.Series([False] * len(result_df))).sum())
+    reviews = int(result_df.get("needs_review", pd.Series([False] * len(result_df))).sum())
 
-    logger.info(f"V1 생성 완료: {v1_ok}건")
-    logger.info(f"V2 생성 완료: {v2_ok}건")
+    logger.info(f"content 생성 완료: {content_ok}건")
     logger.info(f"오류: {errors}건")
     logger.info(f"검수 필요: {reviews}건")
 

@@ -42,16 +42,18 @@ logger = logging.getLogger(__name__)
 
 # 캠페인메타엔진 운영 시트 컬럼 순서 (target CSV와 동일)
 OUTPUT_COLUMNS = [
+    "id",
     "send_dt", "send_time", "target", "priority", "ad_code",
     "content_type", "goods_id", "category_id", "brand_id", "team_id",
     "braze_campaign_name", "title", "contents", "landing_url", "image_url",
-    "push_url", "feed_url", "webhook_contents", "stopped",
+    "push_url", "feed_url", "webhook_contents",
     # 검수용 컬럼 (담당자 검토용 — Braze 등록 시 제외)
     "[검수용] contents_v1_benefit", "[검수용] contents_v2_brand", "[검수용] contents_v3_best",
     "[검수용] contents_source",
     "[검수용] brand_nm_verified",
     "[검수용] title_source", "[검수용] confidence_v1",
     "[검수용] confidence_v2", "[검수용] confidence_v3",
+    "[검수용] content_nature", "[검수용] benefit_type",
     "[검수용] error_flag", "[검수용] needs_review",
     "[검수용] validation_notes",
     "[검수용] review_score", "[검수용] review_verdict",
@@ -327,6 +329,8 @@ def save_final(result_df: pd.DataFrame, send_dt: str):
         "confidence_v1":     "[검수용] confidence_v1",
         "confidence_v2":     "[검수용] confidence_v2",
         "confidence_v3":     "[검수용] confidence_v3",
+        "content_nature":    "[검수용] content_nature",
+        "benefit_type":      "[검수용] benefit_type",
         "error_flag":        "[검수용] error_flag",
         "needs_review":      "[검수용] needs_review",
         "validation_notes":  "[검수용] validation_notes",
@@ -443,6 +447,8 @@ def save_final_range(result_df: pd.DataFrame, date_from: str, date_to: str) -> P
         "confidence_v1":     "[검수용] confidence_v1",
         "confidence_v2":     "[검수용] confidence_v2",
         "confidence_v3":     "[검수용] confidence_v3",
+        "content_nature":    "[검수용] content_nature",
+        "benefit_type":      "[검수용] benefit_type",
         "error_flag":        "[검수용] error_flag",
         "needs_review":      "[검수용] needs_review",
         "validation_notes":  "[검수용] validation_notes",

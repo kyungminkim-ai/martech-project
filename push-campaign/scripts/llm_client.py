@@ -6,7 +6,13 @@ import logging
 from typing import Optional
 import anthropic
 from config import LLM_MODEL, LLM_MAX_TOKENS, LLM_MAX_RETRIES
-from prompts import build_title_prompt, build_v1_benefit_prompt, build_v2_brand_prompt, build_v3_best_prompt, build_review_prompt, build_category_infer_prompt
+from prompts import (
+    build_title_prompt,
+    build_content_prompt,
+    build_content_fix_prompt,
+    build_review_prompt,
+    build_category_infer_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -81,11 +87,11 @@ def _parse_json(raw: Optional[str]) -> Optional[dict]:
     return None
 
 
-def regenerate_title(brand: str, promotion_content: str, target: str, remarks: str = "") -> Optional[str]:
+def regenerate_title(brand: str, promotion_content: str, target: str, remarks: str = "", collab_pair: str = "", content_nature: str = "", benefit_type: str = "") -> Optional[str]:
     cached = _get_file_value("title")
     if cached is not None:
         return str(cached)
-    prompt = build_title_prompt(brand, promotion_content, target, remarks=remarks)
+    prompt = build_title_prompt(brand, promotion_content, target, remarks=remarks, collab_pair=collab_pair, content_nature=content_nature, benefit_type=benefit_type)
     raw = _call_claude(prompt)
     parsed = _parse_json(raw)
     if parsed and "title" in parsed:
@@ -93,53 +99,22 @@ def regenerate_title(brand: str, promotion_content: str, target: str, remarks: s
     return None
 
 
-def generate_v1(
+def generate_content(
     title: str, brand: str, promotion_content: str,
-    content_type: str, target: str, remarks: str = "",
+    content_type: str, target: str,
+    title_keywords: list = None,
+    collab_pair: str = "",
+    remarks: str = "",
+    content_nature: str = "",
+    benefit_type: str = "",
 ) -> dict:
     cached = _get_file_value("contents")
     if cached is not None:
-        return {"message": str(cached), "confidence": float(_get_file_value("confidence_v1") or 4.0)}
-    prompt = build_v1_benefit_prompt(title, brand, promotion_content, content_type, target, remarks=remarks)
-    raw = _call_claude(prompt)
-    parsed = _parse_json(raw)
-    if parsed and "message" in parsed:
-        return {
-            "message":    str(parsed["message"]),
-            "confidence": float(parsed.get("confidence", 0.0)),
-        }
-    return {"message": None, "confidence": None}
-
-
-def generate_v2(
-    title: str, brand: str, promotion_content: str,
-    content_type: str, target: str, remarks: str = "",
-) -> dict:
-    cached = _get_file_value("contents_v2")
-    if cached is not None:
-        return {"message": str(cached), "confidence": float(_get_file_value("confidence_v2") or 4.0)}
-    prompt = build_v2_brand_prompt(title, brand, promotion_content, content_type, target, remarks=remarks)
-    raw = _call_claude(prompt)
-    parsed = _parse_json(raw)
-    if parsed and "message" in parsed:
-        return {
-            "message":    str(parsed["message"]),
-            "confidence": float(parsed.get("confidence", 0.0)),
-        }
-    return {"message": None, "confidence": None}
-
-
-def generate_v3(
-    title: str, brand: str, promotion_content: str,
-    content_type: str, target: str, remarks: str = "",
-    v1_message: str = "", v2_message: str = "",
-) -> dict:
-    cached = _get_file_value("contents_v3")
-    if cached is not None:
-        return {"message": str(cached), "confidence": float(_get_file_value("confidence_v3") or 4.0)}
-    prompt = build_v3_best_prompt(
+        return {"message": str(cached), "confidence": float(_get_file_value("confidence") or 4.0)}
+    prompt = build_content_prompt(
         title, brand, promotion_content, content_type, target,
-        v1_message=v1_message, v2_message=v2_message, remarks=remarks,
+        title_keywords=title_keywords, collab_pair=collab_pair, remarks=remarks,
+        content_nature=content_nature, benefit_type=benefit_type,
     )
     raw = _call_claude(prompt)
     parsed = _parse_json(raw)
@@ -151,6 +126,27 @@ def generate_v3(
     return {"message": None, "confidence": None}
 
 
+def regenerate_content_fix(
+    title: str, promotion_content: str, target: str,
+    original_content: str, violations: list,
+    title_keywords: list = None,
+) -> Optional[str]:
+    """Pipeline 3 자동 수정용 — 위반 항목을 명시하여 재생성."""
+    from config import LLM_API_AVAILABLE
+    if not LLM_API_AVAILABLE:
+        return None
+    prompt = build_content_fix_prompt(
+        title, promotion_content, target,
+        original_content, violations,
+        title_keywords=title_keywords,
+    )
+    raw = _call_claude(prompt)
+    parsed = _parse_json(raw)
+    if parsed and "message" in parsed:
+        return str(parsed["message"])
+    return None
+
+
 def infer_category_ids(
     event_name: str,
     promotion_content: str,
@@ -158,13 +154,9 @@ def infer_category_ids(
     landing_url: str,
     category_list_str: str,
 ) -> list:
-    """소재 내용 기반 카테고리 코드 유추 (최대 3개 리스트 반환).
-    file mode에서는 응답 파일의 category_codes 필드를 사용한다.
-    API 키도 없고 응답 파일도 없으면 빈 리스트 반환.
-    """
+    """소재 내용 기반 카테고리 코드 유추 (최대 3개 리스트 반환)."""
     from config import LLM_API_AVAILABLE
     if not LLM_API_AVAILABLE:
-        # file mode: pending_jobs 응답 파일에서 category_codes 읽기
         if _file_responses is not None:
             codes = _get_file_value("category_codes")
             if codes and isinstance(codes, list):
@@ -181,9 +173,8 @@ def infer_category_ids(
 
 
 def review_message(
-    title: str, contents_v1: str, contents_v2: str,
+    title: str, contents: str,
     brand: str, promotion_content: str, target: str,
-    contents_v3: str = "",
 ) -> dict:
     score = _get_file_value("review_score")
     if score is not None:
@@ -193,7 +184,7 @@ def review_message(
             "notes":   str(_get_file_value("review_notes") or ""),
             "issues":  list(_get_file_value("review_issues") or []),
         }
-    prompt = build_review_prompt(title, contents_v1, contents_v2, brand, promotion_content, target, contents_v3=contents_v3)
+    prompt = build_review_prompt(title, contents, brand, promotion_content, target)
     raw = _call_claude(prompt)
     parsed = _parse_json(raw)
     if parsed and "score" in parsed:
