@@ -9,6 +9,9 @@
 마케팅 구좌관리 요청(비제스트 RAW)에서 발송 가능한 소재를 선별하고,
 캠페인메타엔진 운영 시트 형식으로 메타데이터 + LLM 메시지를 생성하는 스킬.
 
+> **실행 위치**: 프로젝트 루트(`martech-project/`)에서 실행.
+> 모든 스크립트 명령 앞에 `cd match-salespush-automation/push-campaign &&` 를 붙여 실행.
+
 ---
 
 ## 사용법
@@ -25,7 +28,7 @@
 
 ### Step 0: 입력 파일 확인
 ```python
-# 필수 파일 존재 여부 확인
+# 필수 파일 존재 여부 확인 (경로는 에이전트 디렉터리 기준)
 INPUT_FILES = [
     "input/bizest_raw.csv",    # 비제스트 RAW (필수)
     "input/brand_list.csv",    # 브랜드 목록 (필수)
@@ -37,8 +40,8 @@ send_dt 미지정 시 → 내일 날짜(D+1) 자동 사용
 
 ### Step 1: Pipeline 1 — 소재 선별
 ```bash
-python3 scripts/run.py --stage pipeline1 --date {YYYY-MM-DD} --input {CSV_PATH}
-# 출력: data/pipeline1_output_{date}.csv
+cd match-salespush-automation/push-campaign && python3 scripts/run.py --stage pipeline1 --date {YYYY-MM-DD}
+# 출력: match-salespush-automation/push-campaign/data/pipeline1_output_{date}.csv
 ```
 
 선별 기준 (순서대로 적용):
@@ -59,28 +62,28 @@ python3 scripts/run.py --stage pipeline1 --date {YYYY-MM-DD} --input {CSV_PATH}
 
 ### Step 2: Pipeline 2~4 — 메시지 생성 + 검수 + Red Team
 ```bash
-python3 scripts/run.py --stage all --date {YYYY-MM-DD}
+cd match-salespush-automation/push-campaign && python3 scripts/run.py --stage all --date {YYYY-MM-DD}
 # 입력: data/pipeline1_output_{date}.csv (Pipeline 1 결과)
 # 출력: output/campaign_meta_{YYYYMMDD}_{timestamp}.csv
 ```
 
 개별 파이프라인 단계 실행:
 ```bash
-python3 scripts/run.py --stage pipeline2 --date {YYYY-MM-DD}  # 메타데이터 & 메시지 생성
-python3 scripts/run.py --stage pipeline3 --date {YYYY-MM-DD}  # 검수 검증
-python3 scripts/run.py --stage pipeline4 --date {YYYY-MM-DD}  # LLM Red Team 검토
+cd match-salespush-automation/push-campaign && python3 scripts/run.py --stage pipeline2 --date {YYYY-MM-DD}
+cd match-salespush-automation/push-campaign && python3 scripts/run.py --stage pipeline3 --date {YYYY-MM-DD}
+cd match-salespush-automation/push-campaign && python3 scripts/run.py --stage pipeline4 --date {YYYY-MM-DD}
 ```
 
 Pipeline 2 처리 (소재별):
-1. Rule-based 컬럼 생성 (send_dt, target, priority, content_type, brand_id, ad_code 등)
+1. Rule-based 컬럼 생성 (send_dt, target, priority, content_type, brand_id, goods_id, ad_code 등)
 2. 제목 적합성 판단 → 부적합 시 LLM 재생성
 3. V1 BENEFIT 본문 생성 (LLM)
 4. V2 BRAND 본문 생성 (LLM)
 
-> Pipeline 2 중간 결과는 파일로 저장되지 않음. `--stage all`로 Pipeline 1 → 4를 한 번에 실행 권장.
+> Pipeline 2는 5건마다 체크포인트를 저장한다. 중단 후 재실행 시 자동으로 이어서 처리.
 
 Pipeline 3 처리 (검수 검증 QA):
-- 필수 필드 누락, title 길이, (광고) 접두어, UTM 정합성, 0% 차단 등 검증
+- 필수 필드 누락, title 길이, (광고) 접두어, 본문 길이, UTM 정합성, 0% 차단 등 검증
 - 행 제거 없이 `[검수용]` 컬럼에 이슈 기록
 
 Pipeline 4 처리 (LLM Red Team):
@@ -115,12 +118,13 @@ Pipeline 4 처리 (LLM Red Team):
 | 선별 소재 0건 | 경고 출력 후 빈 CSV 생성 |
 | Claude API 3회 연속 실패 | `error_flag=True` 표시, 해당 소재만 스킵 |
 | 잘못된 날짜 형식 | 형식 오류 안내 (YYYY-MM-DD 요구) |
+| Pipeline 2 중단 후 재실행 | 체크포인트 자동 로드, 이어서 처리 |
 
 ---
 
 ## 참조 문서
 
-- 소재 선별 정책: `references/selection_policy.md`
-- 메시지 생성 정책: `references/message_policy.md`
-- 무신사 브랜드 가이드: `references/brand_guidelines.md`
+- 소재 선별 정책: `match-salespush-automation/push-campaign/references/selection_policy.md`
+- 메시지 생성 정책: `match-salespush-automation/push-campaign/references/message_policy.md`
+- 무신사 브랜드 가이드: `match-salespush-automation/push-campaign/references/brand_guidelines.md`
 - 오케스트레이터: `CLAUDE.md`

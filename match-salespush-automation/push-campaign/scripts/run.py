@@ -589,7 +589,7 @@ def run_range(
         return
 
     # ── Phase 3: Pipeline 2~4 통합 실행 ────────────────────────────────
-    result_df = run_pipeline2(combined_selected, brand_df, category_df)
+    result_df = run_pipeline2(combined_selected, brand_df, category_df, send_dt=f"{d_f}_{d_t}")
     run_log.record_pipeline2(result_df)
 
     result_df = run_pipeline3(result_df, brand_df)
@@ -780,7 +780,7 @@ def main():
             selected_df = pd.read_csv(p1_path, dtype={"id": str})
             logger.info(f"Pipeline 1 출력 로드: {len(selected_df)}건")
 
-        result_df = run_pipeline2(selected_df, brand_df, category_df)
+        result_df = run_pipeline2(selected_df, brand_df, category_df, send_dt=send_dt)
         run_log.record_pipeline2(result_df)
 
     # ── Pipeline 3 ────────────────────────────────────────────────────

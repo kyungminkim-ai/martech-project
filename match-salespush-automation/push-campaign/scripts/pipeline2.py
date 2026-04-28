@@ -3,14 +3,14 @@ import logging
 import pandas as pd
 from config import (
     CONFIDENCE_THRESHOLD, AD_CODE_SEED_FILE, AD_CODE_PREFIX,
-    CAMPAIGN_META_SYNC_PATH,
+    CAMPAIGN_META_SYNC_PATH, DATA_DIR, get_pipeline2_checkpoint_path,
 )
 from rules import (
     classify_target, get_content_type, get_priority, get_category_id,
     is_title_valid, sanitize_title, generate_ad_code, build_push_url,
     append_unsubscribe, lookup_brand_name, build_category_list_str,
     build_braze_campaign_name, build_feed_url, build_webhook_contents,
-    select_contents,
+    select_contents, extract_goods_id,
 )
 from llm_client import regenerate_title, generate_v1, generate_v2, generate_v3, set_current_row, infer_category_ids
 
@@ -99,7 +99,7 @@ def process_row(row: pd.Series, brand_df: pd.DataFrame, current_ad_code: str, ca
     result["category_id"]  = merged_category_id
     result["landing_url"]  = landing_url
     result["image_url"]    = img_url
-    result["goods_id"]     = ""
+    result["goods_id"]     = extract_goods_id(landing_url)
     result["team_id"]      = team_name
     result["stopped"]      = ""
 
@@ -228,15 +228,38 @@ def _postprocess_columns(result: dict) -> dict:
     return result
 
 
-def run_pipeline2(selected_df: pd.DataFrame, brand_df: pd.DataFrame, category_df=None) -> pd.DataFrame:
+_CHECKPOINT_INTERVAL = 5  # 몇 건마다 체크포인트 저장할지
+
+
+def run_pipeline2(selected_df: pd.DataFrame, brand_df: pd.DataFrame, category_df=None, send_dt: str = None) -> pd.DataFrame:
     logger.info(f"Pipeline 2 시작 — {len(selected_df)}건 처리")
 
     current_ad_code = _load_last_ad_code()
-    rows = []
+    rows: list = []
     total = len(selected_df)
 
+    # ── 체크포인트 로드 ──────────────────────────────────────────────────
+    checkpoint_path = get_pipeline2_checkpoint_path(send_dt) if send_dt else None
+    processed_ids: set = set()
+
+    if checkpoint_path and checkpoint_path.exists():
+        try:
+            ckpt_df = pd.read_csv(checkpoint_path, dtype=str)
+            rows = ckpt_df.to_dict("records")
+            processed_ids = {str(r.get("id", "")) for r in rows if r.get("id")}
+            if rows and rows[-1].get("ad_code"):
+                current_ad_code = str(rows[-1]["ad_code"])
+            logger.info(f"체크포인트 로드 — {len(rows)}건 이어서 처리")
+        except Exception as e:
+            logger.warning(f"체크포인트 로드 실패, 처음부터 시작: {e}")
+            rows = []
+            processed_ids = set()
+
     for i, (_, row) in enumerate(selected_df.iterrows(), 1):
-        row_id = row.get("id", f"idx-{i}")
+        row_id = str(row.get("id", f"idx-{i}"))
+        if row_id in processed_ids:
+            logger.info(f"[{i}/{total}] id={row_id} 체크포인트 스킵")
+            continue
         set_current_row(row_id)
         logger.info(f"[{i}/{total}] id={row_id} 처리 중...")
         try:
@@ -248,9 +271,24 @@ def run_pipeline2(selected_df: pd.DataFrame, brand_df: pd.DataFrame, category_df
             logger.error(f"id={row_id} 처리 실패: {e}")
             rows.append({**row.to_dict(), "error_flag": True, "needs_review": True})
 
+        # ── 체크포인트 저장 ──────────────────────────────────────────────
+        if checkpoint_path and len(rows) % _CHECKPOINT_INTERVAL == 0:
+            try:
+                DATA_DIR.mkdir(parents=True, exist_ok=True)
+                pd.DataFrame(rows).to_csv(checkpoint_path, index=False, encoding="utf-8-sig")
+            except Exception:
+                pass
+
     _save_last_ad_code(current_ad_code)
 
     result_df = pd.DataFrame(rows)
+
+    # ── 체크포인트 정리 ──────────────────────────────────────────────────
+    if checkpoint_path and checkpoint_path.exists():
+        try:
+            checkpoint_path.unlink()
+        except Exception:
+            pass
 
     v1_ok    = result_df["contents_v1"].notna().sum() if "contents_v1" in result_df.columns else 0
     v2_ok    = result_df["contents_v2"].notna().sum() if "contents_v2" in result_df.columns else 0

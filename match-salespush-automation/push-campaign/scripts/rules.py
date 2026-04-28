@@ -112,6 +112,14 @@ def is_already_selected(ad_status) -> bool:
     return "광고진행" in status
 
 
+def extract_goods_id(url: Optional[str]) -> str:
+    """landing_url에서 goods ID 추출 (/goods/{id} 패턴)."""
+    if not url:
+        return ""
+    m = re.search(r'/goods/(\d+)', url)
+    return m.group(1) if m else ""
+
+
 def make_sheet_key(landing_url: str, brand_id: str, send_dt: str) -> str:
     return f"{landing_url or ''}|{brand_id or ''}|{send_dt}"
 

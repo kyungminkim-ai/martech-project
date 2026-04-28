@@ -88,3 +88,7 @@ def get_pending_jobs_path(send_dt: str) -> Path:
 
 def get_responses_path(send_dt: str) -> Path:
     return DATA_DIR / f"llm_responses_{send_dt.replace('-', '')}.json"
+
+
+def get_pipeline2_checkpoint_path(send_dt: str) -> Path:
+    return DATA_DIR / f"pipeline2_checkpoint_{send_dt.replace('-', '')}.csv"
