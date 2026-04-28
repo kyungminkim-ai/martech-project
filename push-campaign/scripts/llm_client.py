@@ -48,7 +48,8 @@ def get_client() -> anthropic.Anthropic:
     return _client
 
 
-def _call_claude(prompt: str) -> Optional[str]:
+def _call_claude(system_prompt: str, user_prompt: str) -> Optional[str]:
+    """system_prompt는 cache_control로 캐시되고, user_prompt는 매 호출마다 새로 전송된다."""
     from config import LLM_API_AVAILABLE
     if not LLM_API_AVAILABLE:
         return None
@@ -58,7 +59,12 @@ def _call_claude(prompt: str) -> Optional[str]:
             response = client.messages.create(
                 model=LLM_MODEL,
                 max_tokens=LLM_MAX_TOKENS,
-                messages=[{"role": "user", "content": prompt}],
+                system=[{
+                    "type": "text",
+                    "text": system_prompt,
+                    "cache_control": {"type": "ephemeral"},
+                }],
+                messages=[{"role": "user", "content": user_prompt}],
             )
             return response.content[0].text
         except anthropic.RateLimitError:
@@ -87,12 +93,20 @@ def _parse_json(raw: Optional[str]) -> Optional[dict]:
     return None
 
 
-def regenerate_title(brand: str, promotion_content: str, target: str, remarks: str = "", collab_pair: str = "", content_nature: str = "", benefit_type: str = "") -> Optional[str]:
+def regenerate_title(
+    brand: str, promotion_content: str, target: str,
+    remarks: str = "", collab_pair: str = "",
+    content_nature: str = "", benefit_type: str = "",
+) -> Optional[str]:
     cached = _get_file_value("title")
     if cached is not None:
         return str(cached)
-    prompt = build_title_prompt(brand, promotion_content, target, remarks=remarks, collab_pair=collab_pair, content_nature=content_nature, benefit_type=benefit_type)
-    raw = _call_claude(prompt)
+    sys_p, usr_p = build_title_prompt(
+        brand, promotion_content, target,
+        remarks=remarks, collab_pair=collab_pair,
+        content_nature=content_nature, benefit_type=benefit_type,
+    )
+    raw = _call_claude(sys_p, usr_p)
     parsed = _parse_json(raw)
     if parsed and "title" in parsed:
         return str(parsed["title"])
@@ -111,12 +125,12 @@ def generate_content(
     cached = _get_file_value("contents")
     if cached is not None:
         return {"message": str(cached), "confidence": float(_get_file_value("confidence") or 4.0)}
-    prompt = build_content_prompt(
+    sys_p, usr_p = build_content_prompt(
         title, brand, promotion_content, content_type, target,
         title_keywords=title_keywords, collab_pair=collab_pair, remarks=remarks,
         content_nature=content_nature, benefit_type=benefit_type,
     )
-    raw = _call_claude(prompt)
+    raw = _call_claude(sys_p, usr_p)
     parsed = _parse_json(raw)
     if parsed and "message" in parsed:
         return {
@@ -135,12 +149,12 @@ def regenerate_content_fix(
     from config import LLM_API_AVAILABLE
     if not LLM_API_AVAILABLE:
         return None
-    prompt = build_content_fix_prompt(
+    sys_p, usr_p = build_content_fix_prompt(
         title, promotion_content, target,
         original_content, violations,
         title_keywords=title_keywords,
     )
-    raw = _call_claude(prompt)
+    raw = _call_claude(sys_p, usr_p)
     parsed = _parse_json(raw)
     if parsed and "message" in parsed:
         return str(parsed["message"])
@@ -164,12 +178,27 @@ def infer_category_ids(
         return []
     if not category_list_str:
         return []
-    prompt = build_category_infer_prompt(event_name, promotion_content, main_title, landing_url, category_list_str)
-    raw = _call_claude(prompt)
+    sys_p, usr_p = build_category_infer_prompt(
+        event_name, promotion_content, main_title, landing_url, category_list_str,
+    )
+    raw = _call_claude(sys_p, usr_p)
     parsed = _parse_json(raw)
     if parsed and "codes" in parsed and isinstance(parsed["codes"], list):
         return [str(c).strip() for c in parsed["codes"] if c]
     return []
+
+
+_VALID_ISSUE_CODES = frozenset({
+    "fact_mismatch", "tone_off", "brand_inconsistency", "legal_risk", "other",
+})
+
+
+def _normalize_issues(raw_issues: list) -> list:
+    result = []
+    for item in raw_issues:
+        code = str(item).strip()
+        result.append(code if code in _VALID_ISSUE_CODES else "other")
+    return result
 
 
 def review_message(
@@ -182,16 +211,16 @@ def review_message(
             "score":   float(score),
             "verdict": str(_get_file_value("review_verdict") or "warning"),
             "notes":   str(_get_file_value("review_notes") or ""),
-            "issues":  list(_get_file_value("review_issues") or []),
+            "issues":  _normalize_issues(list(_get_file_value("review_issues") or [])),
         }
-    prompt = build_review_prompt(title, contents, brand, promotion_content, target)
-    raw = _call_claude(prompt)
+    sys_p, usr_p = build_review_prompt(title, contents, brand, promotion_content, target)
+    raw = _call_claude(sys_p, usr_p)
     parsed = _parse_json(raw)
     if parsed and "score" in parsed:
         return {
             "score":   float(parsed.get("score", 3.0)),
             "verdict": str(parsed.get("verdict", "warning")),
             "notes":   str(parsed.get("notes", "")),
-            "issues":  list(parsed.get("issues", [])),
+            "issues":  _normalize_issues(list(parsed.get("issues", []))),
         }
     return {"score": None, "verdict": "warning", "notes": "검토 실패", "issues": []}

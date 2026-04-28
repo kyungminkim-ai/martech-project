@@ -10,7 +10,7 @@
 캠페인메타엔진 운영 시트 형식으로 메타데이터 + LLM 메시지를 생성하는 스킬.
 
 > **실행 위치**: 프로젝트 루트(`martech-project/`)에서 실행.
-> 모든 스크립트 명령 앞에 `cd match-salespush-automation/push-campaign &&` 를 붙여 실행.
+> 모든 스크립트 명령 앞에 `cd push-campaign &&` 를 붙여 실행.
 
 ---
 
@@ -40,8 +40,8 @@ send_dt 미지정 시 → 내일 날짜(D+1) 자동 사용
 
 ### Step 1: Pipeline 1 — 소재 선별
 ```bash
-cd match-salespush-automation/push-campaign && python3 scripts/run.py --stage pipeline1 --date {YYYY-MM-DD}
-# 출력: match-salespush-automation/push-campaign/data/pipeline1_output_{date}.csv
+cd push-campaign && python3 scripts/run.py --stage pipeline1 --date {YYYY-MM-DD}
+# 출력: push-campaign/data/pipeline1_output_{date}.csv
 ```
 
 선별 기준 (순서대로 적용):
@@ -62,23 +62,22 @@ cd match-salespush-automation/push-campaign && python3 scripts/run.py --stage pi
 
 ### Step 2: Pipeline 2~4 — 메시지 생성 + 검수 + Red Team
 ```bash
-cd match-salespush-automation/push-campaign && python3 scripts/run.py --stage all --date {YYYY-MM-DD}
+cd push-campaign && python3 scripts/run.py --stage all --date {YYYY-MM-DD}
 # 입력: data/pipeline1_output_{date}.csv (Pipeline 1 결과)
 # 출력: output/campaign_meta_{YYYYMMDD}_{timestamp}.csv
 ```
 
 개별 파이프라인 단계 실행:
 ```bash
-cd match-salespush-automation/push-campaign && python3 scripts/run.py --stage pipeline2 --date {YYYY-MM-DD}
-cd match-salespush-automation/push-campaign && python3 scripts/run.py --stage pipeline3 --date {YYYY-MM-DD}
-cd match-salespush-automation/push-campaign && python3 scripts/run.py --stage pipeline4 --date {YYYY-MM-DD}
+cd push-campaign && python3 scripts/run.py --stage pipeline2 --date {YYYY-MM-DD}
+cd push-campaign && python3 scripts/run.py --stage pipeline3 --date {YYYY-MM-DD}
+cd push-campaign && python3 scripts/run.py --stage pipeline4 --date {YYYY-MM-DD}
 ```
 
 Pipeline 2 처리 (소재별):
 1. Rule-based 컬럼 생성 (send_dt, target, priority, content_type, brand_id, goods_id, ad_code 등)
 2. 제목 적합성 판단 → 부적합 시 LLM 재생성
-3. V1 BENEFIT 본문 생성 (LLM)
-4. V2 BRAND 본문 생성 (LLM)
+3. 단일 contents 생성 (LLM — 혜택·감성 균형)
 
 > Pipeline 2는 5건마다 체크포인트를 저장한다. 중단 후 재실행 시 자동으로 이어서 처리.
 
@@ -100,10 +99,11 @@ Pipeline 4 처리 (LLM Red Team):
 📊 처리 결과:
   전체 소재: {N}건 → 선별: {M}건
   LLM 생성 성공: {K}건 / 실패: {N-K}건
-  검수 필요 (confidence < 3.0): {P}건
+  검수 필요: {P}건  (낮은 confidence / validation 이슈 / Red Team warning·fail)
 
 📁 산출물:
   output/campaign_meta_{YYYYMMDD}_{timestamp}.csv
+  logs/run_{timestamp}.json
 
 ⚠️ 검수 필요 항목: [{목록}]
 ```
@@ -124,7 +124,7 @@ Pipeline 4 처리 (LLM Red Team):
 
 ## 참조 문서
 
-- 소재 선별 정책: `match-salespush-automation/push-campaign/references/selection_policy.md`
-- 메시지 생성 정책: `match-salespush-automation/push-campaign/references/message_policy.md`
-- 무신사 브랜드 가이드: `match-salespush-automation/push-campaign/references/brand_guidelines.md`
+- 소재 선별 정책: `push-campaign/references/selection_policy.md`
+- 메시지 생성 정책: `push-campaign/references/message_policy.md`
+- 무신사 브랜드 가이드: `push-campaign/references/brand_guidelines.md`
 - 오케스트레이터: `CLAUDE.md`

@@ -74,16 +74,21 @@
 [Pipeline 2 — 메타데이터 & 메시지 생성]
       ├── Rule-based: send_dt, target(성별), priority, content_type, brand_id,
       │              category_id, landing_url, image_url, ad_code, push_url
-      └── LLM(Claude): title 검증/재생성, contents V1(혜택강조), V2(브랜드감성)
+      └── LLM(Claude): title 검증/재생성, contents 단일 생성 (혜택·감성 균형)
+      │   ※ main_title 40자 초과 시 쉼표 앞 훅 부분을 제목으로 자동 추출
+      │   ※ 제목 키워드를 content 프롬프트에 "금지 단어"로 주입해 중복 사전 차단
       │
-[Pipeline 3 — 검수 검증 (Validation QA)]
+[Pipeline 3 — 검수 검증 (Validation QA) + 자동 수정]
       ├── 필수 필드 누락 체크 (title, contents, landing_url, ad_code)
-      ├── title 길이 범위 검증 (15~40자)
+      ├── title 길이 범위 검증 (5~40자)
       ├── (광고) 접두어 및 수신거부 문구 확인
       ├── push_url UTM 파라미터 정합성 검증
       ├── 할인율 0% 표기 차단
       ├── landing_url https 형식 검증
       ├── ad_code 중복 검사
+      ├── 동사형 종결 감지 → LLM 재호출로 자동 수정 (최대 2회)
+      ├── 제목-본문 중복 감지 → LLM 재호출로 자동 수정 (최대 2회)
+      ├── 할인율 정합성 검증 (Bizest RAW 수치와 생성 본문 수치 비교)
       └── LLM confidence 임계값 미달 플래그
       │ (행 제거 없이 [검수용] 컬럼에 이슈 내용 기록)
       │
@@ -133,11 +138,19 @@
 
 | 컬럼 | 조건 | 규격 |
 |------|------|------|
-| `title` | `main_title`이 15~40자 + 브랜드/혜택 키워드 포함이면 원본 사용, 그 외 LLM 재생성 | 15~40자, 명사형 종결 |
-| `contents` (V1 BENEFIT) | 모든 선정 소재 | `(광고) ` 시작, 40~60자, 혜택 수치 강조 |
-| `contents` (V2 BRAND) | 모든 선정 소재 | `(광고) ` 시작, 25~45자, 브랜드 감성 |
+| `title` | `main_title`이 5~40자이면 원본 사용 (40자 초과 시 쉼표 앞 훅 부분 추출), 그 외 LLM 재생성 | 5~40자, 명사형 종결 |
+| `contents` | 모든 선정 소재 — 단일 LLM 호출로 혜택·감성 균형 생성 | `(광고) ` 시작, 25~60자, 명사형 종결 |
 
-> Phase 1은 V1, V2 모두 생성 후 담당자가 선택. 운영 시트에는 V1을 기본 `contents`로, V2는 별도 컬럼 `contents_v2`로 병기.
+### 제목-본문 이어쓰기 원칙
+
+제목은 **주어(정체성)**, 본문은 **서술어(행동/혜택)**로 두 문장이 자연스럽게 이어져야 한다.
+
+| 역할 | 담당 내용 | 금지 |
+|------|---------|------|
+| 제목 | 브랜드명·콜라보 대상·상품명·훅 문구 | 발매/선론칭/할인 등 행동어 |
+| 본문 | 발매·기간·혜택·긴급성 | 제목 단어/문구 반복 |
+
+예) 제목: "더마토리 X 톡신 공동개발 블랙세럼" / 본문: "(광고) 4/27~29 단 3일 선론칭"
 
 상세 정책: `references/message_policy.md`
 
@@ -146,23 +159,24 @@
 ## 출력 형식 (캠페인메타엔진 운영 시트)
 
 ```
+id,
 send_dt, send_time, target, priority, ad_code, content_type,
 goods_id, category_id, brand_id, team_id, braze_campaign_name,
 title, contents, landing_url, image_url,
-push_url, feed_url, webhook_contents, stopped
+push_url, feed_url, webhook_contents
 ```
 
 **검수용 컬럼 (담당자 검토 후 Braze 등록 시 제외):**
 ```
-[검수용] contents_v2, [검수용] title_source,
-[검수용] confidence_v1, [검수용] confidence_v2,
+[검수용] brand_nm_verified,
+[검수용] title_source, [검수용] confidence,
+[검수용] content_nature, [검수용] benefit_type,
 [검수용] error_flag, [검수용] needs_review, [검수용] validation_notes,
 [검수용] review_score, [검수용] review_verdict,
 [검수용] review_notes, [검수용] review_issues
 ```
 
 > `goods_id`, `team_id`, `braze_campaign_name`, `feed_url`, `webhook_contents`, `stopped`은 자동화 대상 외 컬럼 — 공란 또는 시트 내 함수 처리
-> `contents`는 V1(혜택강조) 기본 적용, V2(브랜드감성)는 `[검수용] contents_v2`로 병기
 
 ---
 

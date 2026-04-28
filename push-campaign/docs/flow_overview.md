@@ -1,7 +1,7 @@
 # 앱푸시 캠페인 소재 자동화 시스템 — 플로우 개요
 
 > 대상 독자: 마케팅팀 운영 담당자
-> 마지막 수정: 2026-04-24
+> 마지막 수정: 2026-04-29 (range 모드 실행 방법 추가)
 
 ---
 
@@ -44,8 +44,7 @@ flowchart TD
         direction TB
         G1["Rule-based 컬럼 생성\ntarget, priority, ad_code, push_url 등"] --> G2
         G2["LLM 호출 (Claude API)\ntitle 검증/재생성"] --> G3
-        G3["LLM 호출 (Claude API)\ncontents V1 혜택강조"] --> G4
-        G4["LLM 호출 (Claude API)\ncontents V2 브랜드감성"]
+        G3["LLM 호출 (Claude API)\ncontents 단일 생성 (혜택·감성 균형)"]
     end
 
     P2 --> P3
@@ -103,7 +102,7 @@ flowchart LR
 
     subgraph P2L["Pipeline 2 (메시지 생성)"]
         direction TB
-        P2A["Rule-based 메타데이터"] --> P2B["title 생성"] --> P2C["V1 혜택강조"] --> P2D["V2 브랜드감성"]
+        P2A["Rule-based 메타데이터"] --> P2B["title 생성"] --> P2C["contents 단일 생성"]
     end
 
     subgraph P3L["Pipeline 3 (검수 검증)"]
@@ -118,8 +117,7 @@ flowchart LR
 
     subgraph LLM["☁️ Claude API"]
         L1["title 재생성"]
-        L2["V1 contents 생성"]
-        L3["V2 contents 생성"]
+        L2["contents 생성"]
         L4["Red Team 검토"]
     end
 
@@ -128,10 +126,8 @@ flowchart LR
     P1L -->|선별 소재| P2L
     P2B --> L1
     P2C --> L2
-    P2D --> L3
     L1 --> P2B
     L2 --> P2C
-    L3 --> P2D
     P2L -->|메시지 포함 결과| P3L
     P3L -->|검수 플래그 적용| P4L
     P4A --> L4
@@ -183,11 +179,8 @@ flowchart LR
 
 | 컬럼 | 조건 | 규격 |
 |------|------|------|
-| `title` | `main_title`이 15~40자 + 브랜드/혜택 키워드 포함 → 원본 사용, 그 외 → LLM 재생성 | 15~40자, 명사형 종결 |
-| `contents` (V1 혜택강조) | 모든 선별 소재 | `(광고) ` 시작, 40~60자, 혜택 수치 강조 |
-| `[검수용] contents_v2` (V2 브랜드감성) | 모든 선별 소재 | `(광고) ` 시작, 25~45자, 브랜드/감성 |
-
-> V1이 `contents`(기본값), V2는 `[검수용] contents_v2`로 병기. 담당자가 최종 선택.
+| `title` | `main_title`이 5~40자이면 원본 사용 (40자 초과 시 쉼표 앞 훅 추출), 그 외 LLM 재생성 | 5~40자, 명사형 종결 |
+| `contents` | 모든 선별 소재 — 단일 LLM 호출로 혜택·감성 균형 생성 | `(광고) ` 시작, 25~60자 |
 
 ---
 
@@ -207,7 +200,7 @@ flowchart LR
 | 8 | landing_url https 미적용 | `landing_url_not_https` | ⚠️ 검수 |
 | 9 | ad_code 중복 | `ad_code_duplicate` | ⚠️ 검수 |
 | 10 | brand_id 누락 | `brand_id_missing` | ⛔ 오류 |
-| 11 | LLM confidence 임계값 미달 (기준: 3.0) | `low_confidence_v1/v2(N)` | ⚠️ 검수 |
+| 11 | LLM confidence 임계값 미달 (기준: 3.0) | `low_confidence(N)` | ⚠️ 검수 |
 | 12 | title LLM 생성 실패(fallback) | `title_source_fallback` | ⚠️ 검수 |
 
 **출력 컬럼:**
@@ -243,8 +236,13 @@ warning/fail 판정 시 `[검수용] needs_review` 플래그를 `True`로 상향
 
 ```
 output/
-└── campaign_meta_YYYYMMDD_HHmmss.csv
+├── campaign_meta_YYYYMMDD_HHmmss.csv          # 단일 날짜 실행
+├── campaign_meta_{from}_{to}_HHmmss.csv       # range 모드 (날짜 범위 통합)
+└── selection_report_{from}_{to}.csv           # range 모드 통합 선별 리포트
 ```
+
+> range 모드 선별 리포트의 컬럼명은 `발송예정일` (단일 모드의 `send_dt`와 다름).
+> 선별 통과 항목과 URL 탈락 항목만 포함하며 nan 빈 행은 제외된다.
 
 ### 출력 컬럼 (캠페인메타엔진 운영 시트 형식)
 
@@ -261,18 +259,16 @@ output/
 | `brand_id` | 브랜드 ID | ✅ |
 | `team_id` | 팀 ID | — 공란 |
 | `braze_campaign_name` | Braze 캠페인명 | — 공란 |
-| `title` | 푸시 제목 (15~40자) | ✅ |
-| `contents` | 푸시 본문 V1 혜택강조 | ✅ LLM |
+| `title` | 푸시 제목 (5~40자) | ✅ |
+| `contents` | 푸시 본문 (혜택·감성 균형) | ✅ LLM |
 | `landing_url` | 랜딩 URL | ✅ |
 | `image_url` | 이미지 URL | ✅ |
 | `push_url` | UTM 포함 푸시 URL | ✅ |
 | `feed_url` | 피드 URL | — 공란 |
 | `webhook_contents` | 웹훅 내용 | — 공란 |
 | `stopped` | 중단 여부 | — 공란 |
-| `[검수용] contents_v2` | 푸시 본문 V2 브랜드감성 | ✅ LLM |
 | `[검수용] title_source` | title 출처 (original/llm/fallback) | ✅ |
-| `[검수용] confidence_v1` | V1 LLM 신뢰도 (1~5) | ✅ |
-| `[검수용] confidence_v2` | V2 LLM 신뢰도 (1~5) | ✅ |
+| `[검수용] confidence` | LLM 신뢰도 (1~5) | ✅ |
 | `[검수용] error_flag` | 오류 여부 | ✅ |
 | `[검수용] needs_review` | 검수 필요 여부 | ✅ |
 | `[검수용] validation_notes` | 검증 이슈 상세 | ✅ |
@@ -285,7 +281,7 @@ output/
 
 ```bash
 # 1. 디렉터리 이동
-cd match-push-agent-system
+cd push-campaign
 
 # 2. .env 파일 생성 (.env.example 복사)
 cp .env.example .env
@@ -295,7 +291,43 @@ cp .env.example .env
 pip3 install -r requirements.txt
 ```
 
-### 매일 실행
+### 기간 일괄 실행 (권장 — range 모드)
+
+**날짜 간 중복 제거를 보장**하므로 주간/기간 실행에는 range 모드를 사용한다.
+
+#### Claude Code 스킬로 실행 (권장)
+
+```
+/push-campaign-range --start 2026-04-27 --end 2026-05-07
+/push-campaign-range 이번 주
+/push-campaign-range 다음 주
+```
+
+#### CLI로 직접 실행 (ANTHROPIC_API_KEY 설정 시)
+
+```bash
+cd push-campaign
+python3 scripts/run.py --from 2026-04-27 --to 2026-05-07
+```
+
+#### Claude Code 모드 (API 키 없을 때) — 2단계 실행
+
+```bash
+# 1단계: Pipeline 1 실행 → pending_jobs 생성
+cd push-campaign
+python3 scripts/run.py --from 2026-04-27 --to 2026-05-07
+# → data/pending_jobs_20260427_20260507.json 생성
+# → output/selection_report_20260427_20260507.csv 생성
+
+# 2단계: Claude Code가 LLM 응답 생성 (→ /push-campaign-range 스킬이 자동 처리)
+# data/llm_responses_20260427_20260507.json 저장 후
+
+# 3단계: 재실행 → Pipeline 2~4 완료
+python3 scripts/run.py --from 2026-04-27 --to 2026-05-07
+# → output/campaign_meta_20260427_20260507_HHmmss.csv 생성
+```
+
+### 단일 날짜 실행
 
 ```bash
 # 내일 날짜 자동으로 실행 (기본값)
@@ -303,24 +335,13 @@ python3 scripts/run.py
 
 # 발송일 지정
 python3 scripts/run.py --date 2026-05-01
-
-# 입력 파일 직접 지정
-python3 scripts/run.py --date 2026-05-01 --input input/my_raw.csv
 ```
 
-### 단계별 실행
+### 단계별 실행 (디버그용)
 
 ```bash
-# Pipeline 1만 (소재 선별)
 python3 scripts/run.py --stage pipeline1 --date 2026-05-01
-
-# Pipeline 2만 (메시지 생성, Pipeline 1 결과 필요)
 python3 scripts/run.py --stage pipeline2 --date 2026-05-01
-
-# Pipeline 3만 (검수 검증, Pipeline 1 결과 필요)
-python3 scripts/run.py --stage pipeline3 --date 2026-05-01
-
-# 전체 (기본값)
 python3 scripts/run.py --stage all --date 2026-05-01
 ```
 
@@ -329,7 +350,7 @@ python3 scripts/run.py --stage all --date 2026-05-01
 매 실행 전 최신 파일로 교체:
 
 ```
-match-push-agent-system/
+push-campaign/
 └── input/
     ├── bizest_raw.csv     ← [앱푸시 발송 운영] 시트 다운로드
     └── brand_list.csv     ← 브랜드 목록 (변경 시만 교체)
@@ -364,8 +385,8 @@ match-push-agent-system/
 ### 확인 순서
 
 1. `[검수용] error_flag = True` 행 우선 확인 → 내용이 누락되었으므로 수동 작성 필요
-2. `[검수용] needs_review = True` 행 확인 → `[검수용] validation_notes` 내용 검토
-3. `[검수용] contents_v2` 확인 → V1과 비교 후 더 나은 문구 `contents` 컬럼에 수동 복사
+2. `[검수용] needs_review = True` 행 확인 → `[검수용] validation_notes` 및 `[검수용] review_notes` 내용 검토
+3. `[검수용] confidence` 가 낮은 행은 `contents` 직접 수정 후 Braze 등록
 
 ### 자주 나오는 이슈 코드
 
@@ -374,7 +395,7 @@ match-push-agent-system/
 | `title_missing` | LLM API 오류로 제목 생성 실패 | 수동 제목 작성 |
 | `title_length_N chars` | LLM이 범위 밖 제목 생성 | 직접 수정 또는 삭제 |
 | `zero_percent_in_contents` | 할인율 0% 표기 | 내용 수정 또는 행 제외 |
-| `low_confidence_v1(N)` | LLM 신뢰도 낮음 | 문구 직접 검토 및 수정 |
+| `low_confidence(N)` | LLM 신뢰도 낮음 | 문구 직접 검토 및 수정 |
 | `title_source_fallback` | 원본과 LLM 제목 모두 부적합 | 제목 수동 작성 |
 
 ---
@@ -382,7 +403,7 @@ match-push-agent-system/
 ## 9. 디렉터리 구조
 
 ```
-match-push-agent-system/
+push-campaign/
 ├── CLAUDE.md                          # 에이전트 오케스트레이터 설명
 ├── .env                               # API 키 (git 제외)
 ├── .env.example                       # API 키 예시
@@ -405,12 +426,16 @@ match-push-agent-system/
 │   ├── pipeline1.py                   # 소재 선별
 │   ├── pipeline2.py                   # 메시지 생성
 │   ├── pipeline3.py                   # 검수 검증
+│   ├── pipeline4.py                   # LLM Red Team 검토
 │   ├── rules.py                       # Rule-based 로직
 │   ├── prompts.py                     # LLM 프롬프트
-│   └── llm_client.py                  # Claude API 클라이언트
+│   ├── llm_client.py                  # Claude API 클라이언트
+│   └── run_logger.py                  # 실행 로그
 └── references/                        # 정책 문서
     ├── selection_policy.md
     ├── message_policy.md
+    ├── writing_policy.md
+    ├── classification_policy.md
     └── brand_guidelines.md
 ```
 

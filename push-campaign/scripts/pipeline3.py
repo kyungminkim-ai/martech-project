@@ -1,7 +1,8 @@
-"""Pipeline 3 — 검수 검증 (Validation QA).
+"""Pipeline 3 — 검수 검증 (Validation QA) + 자동 수정.
 
-Pipeline 2 결과물에 대해 발송 전 문제가 될 수 있는 항목을 객관적으로 검증한다.
-행을 제거하지 않고 이슈를 플래그로 표시하여 담당자가 최종 판단하도록 한다.
+규칙 위반(동사형 종결, 제목-본문 중복)은 LLM 재호출로 자동 수정한다.
+나머지 이슈는 플래그로 기록하여 담당자가 최종 판단하도록 한다.
+행은 제거하지 않는다.
 """
 import re
 import logging
@@ -10,13 +11,101 @@ import pandas as pd
 from config import (
     TITLE_MIN_LEN, TITLE_MAX_LEN, UNSUBSCRIBE_TEXT,
     AD_CODE_PREFIX, CONFIDENCE_THRESHOLD,
-    CONTENTS_V1_MIN_LEN, CONTENTS_V1_MAX_LEN,
-    CONTENTS_V2_MIN_LEN, CONTENTS_V2_MAX_LEN,
-    CONTENTS_V3_MIN_LEN, CONTENTS_V3_MAX_LEN,
+    CONTENTS_MIN_LEN, CONTENTS_MAX_LEN,
 )
-from rules import lookup_brand_names
+from rules import lookup_brand_names, extract_title_keywords, append_unsubscribe, detect_collab_pair
 
 logger = logging.getLogger(__name__)
+
+# 금지 동사형 종결 패턴 (본문 끝부분 검사)
+_VERB_ENDING_RE = re.compile(
+    r'(?:서둘러요|해보세요|놓치지\s*마세요|받아보세요|만나보세요|느껴보세요|'
+    r'확인하세요|경험해보세요|가세요|오세요|사세요|하세요|마세요)[!.]?\s*$'
+)
+
+
+def _strip_unsubscribe(text: str) -> str:
+    return re.sub(r'\n수신거부.*$', '', text or '', flags=re.DOTALL).strip()
+
+
+def _extract_discount_rates(text: str) -> set:
+    return {int(m) for m in re.findall(r'(\d+)\s*%', text)}
+
+
+def _has_verb_ending(contents: str) -> bool:
+    """본문(수신거부 제외)이 금지 동사형 종결로 끝나면 True."""
+    body = _strip_unsubscribe(contents)
+    return bool(_VERB_ENDING_RE.search(body))
+
+
+def _check_title_body_overlap(title: str, body: str, collab_pair: str = "") -> bool:
+    """제목 어절(3자 이상) 중 2개 이상이 본문에 포함되면 True.
+
+    콜라보 소재는 각 브랜드명이 개별로 본문에 등장하는 것은 허용하지만,
+    쌍 전체(A x B 형태)가 본문에 그대로 반복되거나 개별 브랜드가 2개 이상
+    동시에 등장하는 경우에만 위반으로 판정한다.
+    """
+    body_lower = body.lower()
+
+    if collab_pair:
+        # 콜라보 쌍 자체가 본문에 통째로 반복되면 위반
+        pair_flat = collab_pair.lower().replace(" x ", "").replace(" × ", "")
+        parts = [p.strip().lower() for p in re.split(r'\s*[Xx×]\s*', collab_pair) if p.strip()]
+        # 쌍이 통째로 나타나면 위반
+        if re.search(re.escape(collab_pair.lower()), body_lower):
+            return True
+        # 개별 브랜드 2개가 모두 본문에 반복되면 위반 (단독 1개는 허용)
+        matched = sum(1 for p in parts if p in body_lower)
+        return matched >= 2
+
+    words = [w for w in re.split(r'[\s,·×xX\-]', title) if len(w) >= 3]
+    if len(words) < 2:
+        return False
+    matches = sum(1 for w in words if w.lower() in body_lower)
+    return matches >= 2
+
+
+def _try_auto_fix(
+    title: str, contents: str, row: pd.Series,
+    violations: list, collab_pair: str = "", max_attempts: int = 2,
+) -> str:
+    """LLM을 호출해 위반 사항을 자동 수정. 실패 시 원본 반환."""
+    try:
+        from llm_client import regenerate_content_fix
+        title_keywords = extract_title_keywords(title, collab_pair=collab_pair)
+        promotion_content = str(row.get("promotion_content", "") or "")
+        target = str(row.get("target", "전체") or "전체")
+
+        for attempt in range(max_attempts):
+            fixed_msg = regenerate_content_fix(
+                title=title,
+                promotion_content=promotion_content,
+                target=target,
+                original_content=contents,
+                violations=violations,
+                title_keywords=title_keywords,
+            )
+            if not fixed_msg:
+                logger.debug(f"자동 수정 LLM 무응답 (시도 {attempt + 1})")
+                continue
+            fixed_with_unsub = append_unsubscribe(fixed_msg)
+            still_verb = _has_verb_ending(fixed_with_unsub)
+            still_overlap = _check_title_body_overlap(title, fixed_with_unsub, collab_pair)
+            if not still_verb and not still_overlap:
+                logger.info(f"자동 수정 성공 (시도 {attempt + 1}): {violations}")
+                return fixed_with_unsub
+            remaining = []
+            if still_verb:
+                remaining.append("verb_ending_in_contents")
+            if still_overlap:
+                remaining.append("title_body_overlap_in_contents")
+            logger.debug(
+                f"자동 수정 후 위반 잔존 (시도 {attempt + 1}): {remaining} | "
+                f"생성된 본문: {fixed_msg[:60]!r}"
+            )
+    except Exception as e:
+        logger.warning(f"자동 수정 실패: {e}")
+    return contents
 
 
 def _check_row(row: pd.Series, seen_ad_codes: set, brand_df: Optional[pd.DataFrame] = None) -> tuple:
@@ -25,26 +114,16 @@ def _check_row(row: pd.Series, seen_ad_codes: set, brand_df: Optional[pd.DataFra
 
     title       = str(row.get("title", "") or "")
     contents    = str(row.get("contents", "") or "")
-    contents_v1 = str(row.get("contents_v1", "") or "")
-    contents_v2 = str(row.get("contents_v2", "") or "")
-    contents_v3 = str(row.get("contents_v3", "") or "")
     land_url    = str(row.get("landing_url", "") or "")
     push_url    = str(row.get("push_url", "") or "")
     ad_code     = str(row.get("ad_code", "") or "")
     brand_id    = str(row.get("brand_id", "") or "")
-    conf_v1     = row.get("confidence_v1")
-    conf_v2     = row.get("confidence_v2")
+    confidence  = row.get("confidence")
     brand_nm_verified = ""
 
     # ── 1. 필수 필드 누락 ────────────────────────────────────────────────
     if not title:
         issues.append("title_missing")
-    if not contents_v1:
-        issues.append("contents_v1_missing")
-    if not contents_v2:
-        issues.append("contents_v2_missing")
-    if not contents_v3:
-        issues.append("contents_v3_missing")
     if not contents:
         issues.append("contents_missing")
     if not land_url:
@@ -56,69 +135,42 @@ def _check_row(row: pd.Series, seen_ad_codes: set, brand_df: Optional[pd.DataFra
     if title and not (TITLE_MIN_LEN <= len(title) <= TITLE_MAX_LEN):
         issues.append(f"title_length_{len(title)}chars(expected {TITLE_MIN_LEN}-{TITLE_MAX_LEN})")
 
-    # ── 2b. 본문 길이 범위 (수신거부·접두어 제외 순수 본문 기준) ─────────
-    def _body_len(text: str) -> int:
-        return len(text.replace("(광고) ", "", 1).split(UNSUBSCRIBE_TEXT)[0].strip())
+    # ── 3. 본문 길이 범위 (수신거부·접두어 제외) ─────────────────────────
+    if contents:
+        body_len = len(_strip_unsubscribe(contents).replace("(광고) ", "", 1))
+        if not (CONTENTS_MIN_LEN <= body_len <= CONTENTS_MAX_LEN):
+            issues.append(f"contents_length_{body_len}chars(expected {CONTENTS_MIN_LEN}-{CONTENTS_MAX_LEN})")
 
-    if contents_v1:
-        bl = _body_len(contents_v1)
-        if not (CONTENTS_V1_MIN_LEN <= bl <= CONTENTS_V1_MAX_LEN):
-            issues.append(f"v1_length_{bl}chars(expected {CONTENTS_V1_MIN_LEN}-{CONTENTS_V1_MAX_LEN})")
-    if contents_v2:
-        bl = _body_len(contents_v2)
-        if not (CONTENTS_V2_MIN_LEN <= bl <= CONTENTS_V2_MAX_LEN):
-            issues.append(f"v2_length_{bl}chars(expected {CONTENTS_V2_MIN_LEN}-{CONTENTS_V2_MAX_LEN})")
-    if contents_v3:
-        bl = _body_len(contents_v3)
-        if not (CONTENTS_V3_MIN_LEN <= bl <= CONTENTS_V3_MAX_LEN):
-            issues.append(f"v3_length_{bl}chars(expected {CONTENTS_V3_MIN_LEN}-{CONTENTS_V3_MAX_LEN})")
-
-    # ── 3. (광고) 접두어 — contents, V1, V2, V3 각각 검사 ──────────────
+    # ── 4. (광고) 접두어 ─────────────────────────────────────────────────
     if contents and not contents.startswith("(광고)"):
         issues.append("missing_(광고)_prefix")
-    if contents_v1 and not contents_v1.startswith("(광고)"):
-        issues.append("missing_(광고)_prefix_v1")
-    if contents_v2 and not contents_v2.startswith("(광고)"):
-        issues.append("missing_(광고)_prefix_v2")
-    if contents_v3 and not contents_v3.startswith("(광고)"):
-        issues.append("missing_(광고)_prefix_v3")
 
-    # ── 4. 수신거부 문구 — contents, V1, V2, V3 각각 검사 ──────────────
+    # ── 5. 수신거부 문구 ─────────────────────────────────────────────────
     if contents and UNSUBSCRIBE_TEXT not in contents:
         issues.append("missing_unsubscribe_text")
-    if contents_v1 and UNSUBSCRIBE_TEXT not in contents_v1:
-        issues.append("missing_unsubscribe_text_v1")
-    if contents_v2 and UNSUBSCRIBE_TEXT not in contents_v2:
-        issues.append("missing_unsubscribe_text_v2")
-    if contents_v3 and UNSUBSCRIBE_TEXT not in contents_v3:
-        issues.append("missing_unsubscribe_text_v3")
 
-    # ── 5. push_url UTM 파라미터 ─────────────────────────────────────────
+    # ── 6. push_url UTM 파라미터 ─────────────────────────────────────────
     if push_url and "utm_source" not in push_url:
         issues.append("push_url_missing_utm")
     if push_url and f"utm_campaign={ad_code}" not in push_url:
         issues.append("push_url_campaign_mismatch")
 
-    # ── 6. 할인율 0% 차단 — V1, V2, V3 각각 검사 ───────────────────────
-    if contents_v1 and re.search(r'\b0\s*%', contents_v1):
-        issues.append("zero_percent_in_v1")
-    if contents_v2 and re.search(r'\b0\s*%', contents_v2):
-        issues.append("zero_percent_in_v2")
-    if contents_v3 and re.search(r'\b0\s*%', contents_v3):
-        issues.append("zero_percent_in_v3")
+    # ── 7. 할인율 0% 차단 ────────────────────────────────────────────────
+    if contents and re.search(r'\b0\s*%', contents):
+        issues.append("zero_percent_in_contents")
 
-    # ── 7. landing_url https 형식 ────────────────────────────────────────
+    # ── 8. landing_url https 형식 ────────────────────────────────────────
     if land_url and not land_url.startswith("https://"):
         issues.append("landing_url_not_https")
 
-    # ── 8. ad_code 중복 ─────────────────────────────────────────────────
+    # ── 9. ad_code 중복 ─────────────────────────────────────────────────
     if ad_code:
         if ad_code in seen_ad_codes:
             issues.append("ad_code_duplicate")
         else:
             seen_ad_codes.add(ad_code)
 
-    # ── 9. brand_id 누락 + brand_nm_verified 수집 ────────────────────────
+    # ── 10. brand_id 누락 + brand_nm_verified 수집 ───────────────────────
     if not brand_id:
         issues.append("brand_id_missing")
     elif brand_df is not None and not brand_df.empty:
@@ -129,71 +181,113 @@ def _check_row(row: pd.Series, seen_ad_codes: set, brand_df: Optional[pd.DataFra
             brand_nm_verified = "확인 필요"
             issues.append(f"brand_not_in_list({brand_id})")
 
-    # ── 10. LLM confidence 임계값 미달 ──────────────────────────────────
+    # ── 11. LLM confidence 임계값 미달 ──────────────────────────────────
     try:
-        if conf_v1 is not None and float(conf_v1) < CONFIDENCE_THRESHOLD:
-            issues.append(f"low_confidence_v1({conf_v1})")
-    except (ValueError, TypeError):
-        pass
-    try:
-        if conf_v2 is not None and float(conf_v2) < CONFIDENCE_THRESHOLD:
-            issues.append(f"low_confidence_v2({conf_v2})")
+        if confidence is not None and float(confidence) < CONFIDENCE_THRESHOLD:
+            issues.append(f"low_confidence({confidence})")
     except (ValueError, TypeError):
         pass
 
-    # ── 11. title_source fallback ────────────────────────────────────────
+    # ── 12. title_source fallback ────────────────────────────────────────
     if str(row.get("title_source", "")) == "fallback":
         issues.append("title_source_fallback")
 
-    # ── 12. 브랜드명 포함 여부 (V1·V2 합산 텍스트 기준) ─────────────────
+    # ── 13. 브랜드명 포함 여부 ───────────────────────────────────────────
     if brand_df is not None and not brand_df.empty and brand_id:
         brand_nm_kr, brand_nm_en = lookup_brand_names(brand_id, brand_df)
         if brand_nm_kr or brand_nm_en:
-            search_text = (title + " " + contents_v1 + " " + contents_v2 + " " + contents_v3).lower()
+            search_text = (title + " " + contents).lower()
             found_kr = bool(brand_nm_kr) and brand_nm_kr.lower() in search_text
             found_en = bool(brand_nm_en) and brand_nm_en.lower() in search_text
             if not (found_kr or found_en):
                 issues.append(f"brand_name_not_in_message({brand_nm_kr or brand_nm_en})")
 
-    # ── 13. 캠페인 소재 category_id 필수 ────────────────────────────────
+    # ── 14. 캠페인 소재 category_id 필수 ────────────────────────────────
     content_type = str(row.get("content_type", "") or "")
     category_id  = str(row.get("category_id",  "") or "")
     if content_type == "캠페인" and not category_id:
         issues.append("campaign_category_id_missing")
 
+    # ── 15. 동사형 종결 위반 ─────────────────────────────────────────────
+    if contents and _has_verb_ending(contents):
+        issues.append("verb_ending_in_contents")
+
+    # ── 16. 제목-본문 이어쓰기 중복 감지 ────────────────────────────────
+    collab_pair = detect_collab_pair(str(row.get("event_name", "") or ""), title)
+    if title and contents and _check_title_body_overlap(title, contents, collab_pair):
+        issues.append("title_body_overlap_in_contents")
+
+    # ── 17. 할인율 정합성 검증 ───────────────────────────────────────────
+    promotion_content = str(row.get("promotion_content", "") or "")
+    raw_rates = _extract_discount_rates(promotion_content)
+    if contents:
+        body_rates = _extract_discount_rates(contents)
+        if body_rates:
+            if raw_rates:
+                max_raw = max(raw_rates)
+                for rate in body_rates:
+                    if rate > max_raw:
+                        issues.append(f"discount_rate_inflated({rate}%>raw_max_{max_raw}%)")
+                unverified = body_rates - raw_rates
+                for rate in sorted(unverified):
+                    issues.append(f"discount_rate_unverified({rate}%_not_in_raw)")
+            else:
+                for rate in sorted(body_rates):
+                    issues.append(f"discount_rate_unverified({rate}%_not_in_raw)")
+
+    # ── 18. image_url 유효성 ─────────────────────────────────────────────
+    image_url = str(row.get("image_url", "") or "")
+    if not image_url:
+        issues.append("image_url_missing")
+    elif not image_url.startswith("https://"):
+        issues.append("image_url_not_https")
+
     return issues, brand_nm_verified
 
 
+_FIXABLE_VIOLATIONS = {"verb_ending_in_contents", "title_body_overlap_in_contents"}
+_BLOCKING_SUFFIXES = ("_missing",)
+
+
 def run_pipeline3(result_df: pd.DataFrame, brand_df: Optional[pd.DataFrame] = None) -> pd.DataFrame:
-    """Pipeline 3 검수 검증 실행.
-
-    Args:
-        result_df: Pipeline 2 결과 DataFrame
-        brand_df: 브랜드 목록 DataFrame (브랜드명 포함 여부 검증용)
-
-    Returns:
-        validation_notes, needs_review, error_flag 컬럼이 갱신된 DataFrame
-    """
+    """Pipeline 3 검수 검증 + 자동 수정 실행."""
     logger.info(f"Pipeline 3 시작 — {len(result_df)}건 검증")
 
+    df = result_df.copy()
     seen_ad_codes: set = set()
     all_notes      = []
     all_needs      = []
     all_errors     = []
     all_brand_nms  = []
+    fix_count      = 0
 
-    BLOCKING_SUFFIXES = ("_missing",)
-
-    for _, row in result_df.iterrows():
+    for idx, row in df.iterrows():
         issues, brand_nm_verified = _check_row(row, seen_ad_codes, brand_df)
 
-        notes  = ", ".join(issues) if issues else ""
+        # ── 자동 수정 (동사형 종결 / 제목-본문 중복) ─────────────────────
+        fixable = [i for i in issues if i in _FIXABLE_VIOLATIONS]
+        if fixable:
+            title      = str(row.get("title", "") or "")
+            contents   = str(row.get("contents", "") or "")
+            row_collab = detect_collab_pair(str(row.get("event_name", "") or ""), title)
+            fixed = _try_auto_fix(title, contents, row, fixable, collab_pair=row_collab)
+            if fixed != contents:
+                df.at[idx, "contents"] = fixed
+                fix_count += 1
+                # 수정 후 fixable 이슈만 재평가
+                remaining_fixable = []
+                if _has_verb_ending(fixed):
+                    remaining_fixable.append("verb_ending_in_contents")
+                if _check_title_body_overlap(title, fixed, row_collab):
+                    remaining_fixable.append("title_body_overlap_in_contents")
+                issues = [i for i in issues if i not in _FIXABLE_VIOLATIONS] + remaining_fixable
+
+        notes = ", ".join(issues) if issues else ""
         is_blocking = any(
-            any(issue.endswith(s) for s in BLOCKING_SUFFIXES)
+            any(issue.endswith(s) for s in _BLOCKING_SUFFIXES)
             for issue in issues
         )
 
-        # Pipeline 2 플래그 유지 (OR 합산)
         prev_error  = bool(row.get("error_flag",   False))
         prev_review = bool(row.get("needs_review", False))
 
@@ -202,7 +296,6 @@ def run_pipeline3(result_df: pd.DataFrame, brand_df: Optional[pd.DataFrame] = No
         all_needs.append(bool(issues) or prev_review)
         all_brand_nms.append(brand_nm_verified)
 
-    df = result_df.copy()
     df["validation_notes"]  = all_notes
     df["error_flag"]        = all_errors
     df["needs_review"]      = all_needs
@@ -214,5 +307,6 @@ def run_pipeline3(result_df: pd.DataFrame, brand_df: Optional[pd.DataFrame] = No
 
     logger.info(f"검증 통과: {pass_cnt}건")
     logger.info(f"이슈 발견: {issue_cnt}건 (blocking: {block_cnt}건)")
+    logger.info(f"자동 수정: {fix_count}건")
 
     return df

@@ -28,9 +28,6 @@ CANCEL_KEYWORDS         = ["취소", "CANCEL", "cancel"]
 SEND_HOUR               = 10  # 발송 윈도우 종료 시각 (D-0 10:00 KST)
 SEND_WINDOW_START_HOUR  = 10  # 발송 윈도우 시작 시각 (D-1 10:00 KST)
 
-# 마케팅 인벤토리 ID (11시 세일즈푸시 대상)
-MARKETING_INVENTORY_IDS = (2, 26, 89, 90, 91, 58)
-
 # 광고 코드 설정
 AD_CODE_PREFIX = "APSCMCD"
 AD_CODE_SEED_FILE = BASE_DIR / "input" / "ad_code_seed.txt"
@@ -48,16 +45,12 @@ CAMPAIGN_META_SYNC_PATH = INPUT_DIR / "campaign_meta_sync.csv"
 PROCESSED_IDS_PATH     = DATA_DIR / "processed_ids.csv"
 
 # 제목 적합성 기준
-TITLE_MIN_LEN = 15
+TITLE_MIN_LEN = 5
 TITLE_MAX_LEN = 40
 
 # 본문 길이 기준 (수신거부 문구·(광고) 접두어 제외 순수 본문 기준)
-CONTENTS_V1_MIN_LEN = 40   # V1 혜택강조
-CONTENTS_V1_MAX_LEN = 60
-CONTENTS_V2_MIN_LEN = 25   # V2 브랜드감성
-CONTENTS_V2_MAX_LEN = 45
-CONTENTS_V3_MIN_LEN = 25   # V3 최선책 합성 (V2 기준)
-CONTENTS_V3_MAX_LEN = 45
+CONTENTS_MIN_LEN = 25
+CONTENTS_MAX_LEN = 60
 MEANINGLESS_TITLES = {"테스트", "123", "123123", "asdf", "test", "제목", ""}
 
 # 수신거부 문구

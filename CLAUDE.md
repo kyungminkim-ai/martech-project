@@ -12,7 +12,7 @@
 | 요청 유형 | 스킬 / 에이전트 |
 |---------|----------------|
 | 앱푸시 소재 선별 & 캠페인 메시지 생성 | Skill: `/push-campaign` |
-| 앱푸시 에이전트 상세 설정 조회 | `match-salespush-automation/push-campaign/CLAUDE.md` |
+| 앱푸시 에이전트 상세 설정 조회 | `push-campaign/CLAUDE.md` |
 | [향후] 이메일 캠페인 소재 생성 | 미구현 — 요청 시 설계 제안 |
 | [향후] SMS 캠페인 소재 생성 | 미구현 — 요청 시 설계 제안 |
 | [향후] 랜딩페이지 헤드라인 생성 | 미구현 — 요청 시 설계 제안 |
@@ -23,9 +23,9 @@
 
 | 에이전트 | 경로 | 상태 |
 |---------|------|------|
-| push-campaign | `match-salespush-automation/push-campaign/` | ✅ 운영 중 |
-| email-campaign | `match-salespush-automation/email-campaign/` | 🔲 미구현 |
-| sms-campaign | `match-salespush-automation/sms-campaign/` | 🔲 미구현 |
+| push-campaign | `push-campaign/` | ✅ 운영 중 |
+| email-campaign | `email-campaign/` | 🔲 미구현 |
+| sms-campaign | `sms-campaign/` | 🔲 미구현 |
 
 ---
 
@@ -54,10 +54,10 @@
 
 새 채널 에이전트를 추가할 때 반드시 따라야 할 순서:
 
-1. `match-salespush-automation/{channel}-campaign/` 디렉터리 생성
+1. `{channel}-campaign/` 디렉터리 생성
 2. 4-phase pipeline 구조 유지 (선별 → 생성 → 검수 → Red Team)
-3. `match-salespush-automation/{channel}-campaign/.claude/skills/{channel}-campaign/SKILL.md` 등록
+3. `{channel}-campaign/.claude/skills/{channel}-campaign/SKILL.md` 등록
 4. 이 파일 라우팅 테이블 & 에이전트 디렉터리 업데이트
 5. 루트 `README.md` 에이전트 현황 업데이트
 
-참고 구현: `match-salespush-automation/push-campaign/`
+참고 구현: `push-campaign/`

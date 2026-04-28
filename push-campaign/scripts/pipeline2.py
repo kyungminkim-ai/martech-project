@@ -1,5 +1,8 @@
 """Pipeline 2 — Rule-based 메타데이터 생성 + LLM 메시지 생성."""
 import logging
+import os
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 from config import (
     CONFIDENCE_THRESHOLD, AD_CODE_SEED_FILE, AD_CODE_PREFIX,
@@ -54,7 +57,13 @@ def _load_last_ad_code() -> str:
 
 def _save_last_ad_code(code: str) -> None:
     AD_CODE_SEED_FILE.parent.mkdir(parents=True, exist_ok=True)
-    AD_CODE_SEED_FILE.write_text(code)
+    tmp = AD_CODE_SEED_FILE.with_suffix(".tmp")
+    try:
+        tmp.write_text(code)
+        os.replace(tmp, AD_CODE_SEED_FILE)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _merge_category_ids(base_cat: str, llm_cats: list) -> str:
@@ -84,7 +93,8 @@ def _trim_long_title(original_title: str) -> str:
     return original_title
 
 
-def process_row(row: pd.Series, brand_df: pd.DataFrame, current_ad_code: str, category_df=None) -> dict:
+def process_row(row: pd.Series, brand_df: pd.DataFrame, ad_code: str, category_df=None) -> dict:
+    """단일 행 처리 — ad_code는 호출 전 외부에서 채번해서 전달한다."""
     brand_id          = str(row.get("sourceBrandId", "") or "")
     promotion_content = str(row.get("promotion_content", "") or "")
     landing_url       = str(row.get("landing_url", "") or "").strip()
@@ -119,8 +129,7 @@ def process_row(row: pd.Series, brand_df: pd.DataFrame, current_ad_code: str, ca
     result["team_id"]      = team_name
     result["stopped"]      = ""
 
-    # ── 광고 코드 & push_url ─────────────────────────────────────────────
-    ad_code = generate_ad_code(current_ad_code)
+    # ── 광고 코드 & push_url (ad_code는 호출자가 채번해서 전달) ────────────
     result["ad_code"]   = ad_code
     result["push_url"]  = build_push_url(landing_url, ad_code)
 
@@ -192,7 +201,7 @@ def process_row(row: pd.Series, brand_df: pd.DataFrame, current_ad_code: str, ca
         result["title_source"] == "fallback",
     ])
 
-    return result, ad_code
+    return result
 
 
 _VALID_TARGETS    = {"여성", "남성", "전체"}
@@ -228,57 +237,98 @@ def _postprocess_columns(result: dict) -> dict:
 
 
 _CHECKPOINT_INTERVAL = 5
+_MAX_WORKERS = 6  # LLM 병렬 호출 수 (RateLimit 대비 보수적 설정)
+
+# 체크포인트 기록 시 스레드 안전 보장용 락
+_checkpoint_lock = threading.Lock()
 
 
-def run_pipeline2(selected_df: pd.DataFrame, brand_df: pd.DataFrame, category_df=None, send_dt: str = None) -> pd.DataFrame:
+def run_pipeline2(
+    selected_df: pd.DataFrame,
+    brand_df: pd.DataFrame,
+    category_df=None,
+    send_dt: str = None,
+) -> pd.DataFrame:
     logger.info(f"Pipeline 2 시작 — {len(selected_df)}건 처리")
 
+    # ── ad_code 사전 배정 (순번 보장) ───────────────────────────────────
     current_ad_code = _load_last_ad_code()
-    rows: list = []
     total = len(selected_df)
 
     checkpoint_path = get_pipeline2_checkpoint_path(send_dt) if send_dt else None
     processed_ids: set = set()
+    checkpoint_rows: list = []
 
     if checkpoint_path and checkpoint_path.exists():
         try:
             ckpt_df = pd.read_csv(checkpoint_path, dtype=str)
-            rows = ckpt_df.to_dict("records")
-            processed_ids = {str(r.get("id", "")) for r in rows if r.get("id")}
-            if rows and rows[-1].get("ad_code"):
-                current_ad_code = str(rows[-1]["ad_code"])
-            logger.info(f"체크포인트 로드 — {len(rows)}건 이어서 처리")
+            checkpoint_rows = ckpt_df.to_dict("records")
+            processed_ids = {str(r.get("id", "")) for r in checkpoint_rows if r.get("id")}
+            if checkpoint_rows and checkpoint_rows[-1].get("ad_code"):
+                current_ad_code = str(checkpoint_rows[-1]["ad_code"])
+            logger.info(f"체크포인트 로드 — {len(checkpoint_rows)}건 이어서 처리")
         except Exception as e:
             logger.warning(f"체크포인트 로드 실패, 처음부터 시작: {e}")
-            rows = []
+            checkpoint_rows = []
             processed_ids = set()
 
+    # 처리 대상 행 필터링 + ad_code 사전 배정
+    pending_rows = []
     for i, (_, row) in enumerate(selected_df.iterrows(), 1):
         row_id = str(row.get("id", f"idx-{i}"))
         if row_id in processed_ids:
-            logger.info(f"[{i}/{total}] id={row_id} 체크포인트 스킵")
             continue
+        current_ad_code = generate_ad_code(current_ad_code)
+        pending_rows.append((i, row, current_ad_code))
+
+    last_assigned_code = current_ad_code
+    # 병렬 실행 전 seed 저장 — 중간 크래시 시에도 ad_code 중복 발급 방지
+    _save_last_ad_code(last_assigned_code)
+
+    # ── 병렬 처리 ────────────────────────────────────────────────────────
+    result_map: dict = {}  # row_id → result dict
+
+    def _process(args):
+        seq, row, ad_code = args
+        row_id = str(row.get("id", f"idx-{seq}"))
         set_current_row(row_id)
-        logger.info(f"[{i}/{total}] id={row_id} 처리 중...")
+        logger.info(f"[{seq}/{total}] id={row_id} 처리 중...")
         try:
-            meta, new_ad_code = process_row(row, brand_df, current_ad_code, category_df)
+            meta = process_row(row, brand_df, ad_code, category_df)
             meta = _postprocess_columns(meta)
-            current_ad_code = new_ad_code
-            rows.append({**row.to_dict(), **meta})
+            return row_id, {**row.to_dict(), **meta}
         except Exception as e:
             logger.error(f"id={row_id} 처리 실패: {e}")
-            rows.append({**row.to_dict(), "error_flag": True, "needs_review": True})
+            return row_id, {**row.to_dict(), "error_flag": True, "needs_review": True}
 
-        if checkpoint_path and len(rows) % _CHECKPOINT_INTERVAL == 0:
-            try:
-                DATA_DIR.mkdir(parents=True, exist_ok=True)
-                pd.DataFrame(rows).to_csv(checkpoint_path, index=False, encoding="utf-8-sig")
-            except Exception:
-                pass
+    completed_count = [0]
 
-    _save_last_ad_code(current_ad_code)
+    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
+        futures = {executor.submit(_process, args): args for args in pending_rows}
+        for future in as_completed(futures):
+            row_id, result = future.result()
+            result_map[row_id] = result
+            completed_count[0] += 1
 
-    result_df = pd.DataFrame(rows)
+            if checkpoint_path and completed_count[0] % _CHECKPOINT_INTERVAL == 0:
+                with _checkpoint_lock:
+                    try:
+                        snapshot = checkpoint_rows + list(result_map.values())
+                        DATA_DIR.mkdir(parents=True, exist_ok=True)
+                        pd.DataFrame(snapshot).to_csv(
+                            checkpoint_path, index=False, encoding="utf-8-sig"
+                        )
+                    except Exception:
+                        pass
+
+    # ── 원래 순서 복원 ────────────────────────────────────────────────────
+    ordered_results = list(checkpoint_rows)
+    for _, row, _ in pending_rows:
+        row_id = str(row.get("id", ""))
+        if row_id in result_map:
+            ordered_results.append(result_map[row_id])
+
+    result_df = pd.DataFrame(ordered_results)
 
     if checkpoint_path and checkpoint_path.exists():
         try:

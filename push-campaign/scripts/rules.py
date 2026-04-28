@@ -20,12 +20,6 @@ def is_cancelled(remarks: Optional[str]) -> bool:
     return any(kw.lower() in remarks.lower() for kw in CANCEL_KEYWORDS)
 
 
-def is_marketing_team(team_name: Optional[str]) -> bool:
-    if not team_name:
-        return False
-    return any(kw in team_name for kw in MARKETING_TEAM_KEYWORDS)
-
-
 def _parse_release_dt(release_dt) -> Optional[datetime]:
     """release_start_date_time 값을 datetime으로 파싱.
     단자리 시각(예: '2026-04-27 2:00:00')도 허용.
@@ -449,22 +443,3 @@ def detect_benefit_type(
     return ""
 
 
-def select_contents(
-    v1_message: Optional[str],
-    v2_message: Optional[str],
-    v3_message: Optional[str] = None,
-) -> tuple:
-    """V1·V2·V3 중 발송 본문(contents)을 자동 선택한다.
-
-    우선순위:
-      1. V3 — V1+V2를 합성한 최선책 (항상 최우선)
-      2. V1 — V3 생성 실패 시 폴백
-      3. V2 — V1도 없을 때 최후 폴백
-
-    반환: (선택된 메시지, 소스 "v1"|"v2"|"v3")
-    """
-    if v3_message:
-        return (v3_message, "v3")
-    if v1_message:
-        return (v1_message, "v1")
-    return (v2_message, "v2")

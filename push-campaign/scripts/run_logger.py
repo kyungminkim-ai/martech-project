@@ -60,6 +60,8 @@ class RunLogger:
         self.send_dt    = send_dt
         self.input_file = str(input_file)
         self.run_id     = datetime.now().strftime("%Y%m%d_%H%M%S")
+        LOGS_DIR.mkdir(parents=True, exist_ok=True)
+        self.log_path   = LOGS_DIR / f"run_{self.run_id}.json"
         self._log: dict = {
             "run_id":       self.run_id,
             "send_dt":      send_dt,
@@ -72,6 +74,14 @@ class RunLogger:
             "output_file":  None,
             "completed_at": None,
         }
+
+    def _flush(self) -> None:
+        """현재 _log 상태를 디스크에 즉시 기록."""
+        try:
+            with open(self.log_path, "w", encoding="utf-8") as f:
+                json.dump(self._log, f, ensure_ascii=False, indent=2, default=str)
+        except Exception as e:
+            logger.warning(f"로그 flush 실패: {e}")
 
     # ── Pipeline 1 ────────────────────────────────────────────────────
     def record_pipeline1(
@@ -115,29 +125,32 @@ class RunLogger:
             },
             "rejected_items":    rejected_items[:500],
         }
+        self._flush()
 
     # ── Pipeline 2 ────────────────────────────────────────────────────
     def record_pipeline2(self, result_df: pd.DataFrame) -> None:
-        total  = len(result_df)
-        v1_ok  = int(result_df["contents"].notna().sum())    if "contents"    in result_df.columns else 0
-        v2_ok  = int(result_df["contents_v2"].notna().sum()) if "contents_v2" in result_df.columns else 0
+        total      = len(result_df)
+        content_ok = int(result_df["contents"].notna().sum()) if "contents" in result_df.columns else 0
 
         title_src: dict = {}
         if "title_source" in result_df.columns:
             title_src = result_df["title_source"].value_counts().to_dict()
 
+        conf_values = result_df["confidence"].dropna() if "confidence" in result_df.columns else pd.Series([], dtype=float)
+        avg_conf = round(float(conf_values.mean()), 2) if len(conf_values) > 0 else None
+
         self._log["pipeline2"] = {
-            "processed":    total,
+            "processed":      total,
+            "content_success": content_ok,
+            "content_failed":  total - content_ok,
+            "avg_confidence":  avg_conf,
             "title_source": {
                 "original": title_src.get("original", 0),
                 "llm":      title_src.get("llm",      0),
                 "fallback": title_src.get("fallback",  0),
             },
-            "v1_success":   v1_ok,
-            "v1_failed":    total - v1_ok,
-            "v2_success":   v2_ok,
-            "v2_failed":    total - v2_ok,
         }
+        self._flush()
 
     # ── Pipeline 3 ────────────────────────────────────────────────────
     def record_pipeline3(self, result_df: pd.DataFrame) -> None:
@@ -161,6 +174,7 @@ class RunLogger:
             "errors":       errors,
             "issue_counts": issue_counts,
         }
+        self._flush()
 
     # ── Pipeline 4 ────────────────────────────────────────────────────
     def record_pipeline4(self, result_df: pd.DataFrame) -> None:
@@ -184,26 +198,22 @@ class RunLogger:
             "avg_score":      round(float(scores.mean()), 2) if len(scores) > 0 else None,
             "issue_counts":   issue_counts,
         }
+        self._flush()
 
     # ── Finalize ─────────────────────────────────────────────────────
     def finalize(self, output_file: Optional[str]) -> Path:
         self._log["output_file"]  = str(output_file) if output_file else None
         self._log["completed_at"] = datetime.now().isoformat()
+        self._flush()
+        logger.info(f"실행 로그 저장: {self.log_path}")
+        return self.log_path
 
-        LOGS_DIR.mkdir(parents=True, exist_ok=True)
-        log_path = LOGS_DIR / f"run_{self.run_id}.json"
-        with open(log_path, "w", encoding="utf-8") as f:
-            json.dump(self._log, f, ensure_ascii=False, indent=2, default=str)
-
-        logger.info(f"실행 로그 저장: {log_path}")
-        return log_path
-
-    def print_log_summary(self, log_path: Path) -> None:
+    def print_log_summary(self) -> None:
         p1 = self._log.get("pipeline1") or {}
         p2 = self._log.get("pipeline2") or {}
         p3 = self._log.get("pipeline3") or {}
 
-        print(f"\n📋 실행 로그: {log_path}")
+        print(f"\n📋 실행 로그: {self.log_path}")
 
         if p1:
             print(f"\n[Pipeline 1] 입력={p1['total_input']}건 → 선별={p1['selected']}건 / 탈락={p1['rejected']}건")
@@ -212,9 +222,10 @@ class RunLogger:
 
         if p2:
             ts = p2.get("title_source", {})
+            avg_c = p2.get("avg_confidence")
+            avg_c_str = f"{avg_c:.2f}" if avg_c is not None else "-"
             print(f"\n[Pipeline 2] title_source: 원본={ts.get('original',0)} / LLM재생성={ts.get('llm',0)} / fallback={ts.get('fallback',0)}")
-            print(f"  V1 생성 성공={p2.get('v1_success',0)} / 실패={p2.get('v1_failed',0)}")
-            print(f"  V2 생성 성공={p2.get('v2_success',0)} / 실패={p2.get('v2_failed',0)}")
+            print(f"  content 생성 성공={p2.get('content_success',0)} / 실패={p2.get('content_failed',0)} (평균 confidence={avg_c_str})")
 
         if p3:
             print(f"\n[Pipeline 3] 통과={p3.get('passed',0)} / 검수필요={p3.get('needs_review',0)} / 오류={p3.get('errors',0)}")

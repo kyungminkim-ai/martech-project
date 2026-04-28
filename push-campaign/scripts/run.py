@@ -48,11 +48,8 @@ OUTPUT_COLUMNS = [
     "braze_campaign_name", "title", "contents", "landing_url", "image_url",
     "push_url", "feed_url", "webhook_contents",
     # 검수용 컬럼 (담당자 검토용 — Braze 등록 시 제외)
-    "[검수용] contents_v1_benefit", "[검수용] contents_v2_brand", "[검수용] contents_v3_best",
-    "[검수용] contents_source",
     "[검수용] brand_nm_verified",
-    "[검수용] title_source", "[검수용] confidence_v1",
-    "[검수용] confidence_v2", "[검수용] confidence_v3",
+    "[검수용] title_source", "[검수용] confidence",
     "[검수용] content_nature", "[검수용] benefit_type",
     "[검수용] error_flag", "[검수용] needs_review",
     "[검수용] validation_notes",
@@ -60,25 +57,37 @@ OUTPUT_COLUMNS = [
     "[검수용] review_notes", "[검수용] review_issues",
 ]
 
+# rename_map: pipeline 내부 컬럼명 → 출력 CSV 컬럼명
+_OUTPUT_RENAME_MAP = {
+    "brand_nm_verified": "[검수용] brand_nm_verified",
+    "title_source":      "[검수용] title_source",
+    "confidence":        "[검수용] confidence",
+    "content_nature":    "[검수용] content_nature",
+    "benefit_type":      "[검수용] benefit_type",
+    "error_flag":        "[검수용] error_flag",
+    "needs_review":      "[검수용] needs_review",
+    "validation_notes":  "[검수용] validation_notes",
+    "review_score":      "[검수용] review_score",
+    "review_verdict":    "[검수용] review_verdict",
+    "review_notes":      "[검수용] review_notes",
+    "review_issues":     "[검수용] review_issues",
+}
+
 # pending_jobs JSON에 포함되는 LLM 작업 지침 (단일 날짜 & 범위 공통)
 _PENDING_JOBS_MESSAGE_RULES = {
-    "title":    "15~40자, 명사형 종결, 브랜드명+혜택 포함",
-    "v1":       "(광고) 시작, 40~60자, 혜택 수치 강조, 명사형 종결",
-    "v2":       "(광고) 시작, 25~45자, 브랜드 감성 표현, 수치 최소화",
-    "v3":       "(광고) 시작, 30~50자, 희소성·긴급성 강조 (마감/한정수량/선착순 등), 수치 나열 금지",
-    "review":   "score 1-5, verdict: pass≥3.5/warning 2.5-3.4/fail≤2.4",
+    "title":          "5~40자, 명사형 종결, 브랜드명+정체성 표현 (행동어 금지)",
+    "contents":       "(광고) 시작, 25~60자, 혜택·감성 균형, 명사형 종결",
+    "review":         "score 1-5, verdict: pass≥3.5/warning 2.5-3.4/fail≤2.4",
     "category_codes": "소재 내용 기반 카테고리 코드 최대 3개 (없으면 빈 리스트)",
 }
 
 def _build_pending_instructions(response_filename: str) -> str:
     return (
-        "각 job에 대해 title/contents_v1/contents_v2/contents_v3/review/category_codes를 생성하고 "
+        "각 job에 대해 title/contents/review/category_codes를 생성하고 "
         f"{response_filename}으로 저장하세요. "
         "수신거부 문구는 포함하지 마세요 (Python이 별도 추가). "
         "응답 형식: {\"<id>\": {\"title\": ..., \"title_source\": \"llm\"|\"original\", "
-        "\"contents\": \"(광고) ...\", \"confidence_v1\": 4.0, "
-        "\"contents_v2\": \"(광고) ...\", \"confidence_v2\": 4.0, "
-        "\"contents_v3\": \"(광고) ...\", \"confidence_v3\": 4.0, "
+        "\"contents\": \"(광고) ...\", \"confidence\": 4.0, "
         "\"review_score\": 4.0, \"review_verdict\": \"pass\"|\"warning\"|\"fail\", "
         "\"review_notes\": \"\", \"review_issues\": [], "
         "\"category_codes\": [\"코드1\", \"코드2\"]}}"
@@ -319,33 +328,12 @@ def save_final(result_df: pd.DataFrame, send_dt: str):
     date = send_dt.replace("-", "")
     path = OUTPUT_DIR / f"campaign_meta_{date}_{ts}.csv"
 
-    rename_map = {
-        "contents_v1":       "[검수용] contents_v1_benefit",
-        "contents_v2":       "[검수용] contents_v2_brand",
-        "contents_v3":       "[검수용] contents_v3_best",
-        "contents_source":   "[검수용] contents_source",
-        "brand_nm_verified": "[검수용] brand_nm_verified",
-        "title_source":      "[검수용] title_source",
-        "confidence_v1":     "[검수용] confidence_v1",
-        "confidence_v2":     "[검수용] confidence_v2",
-        "confidence_v3":     "[검수용] confidence_v3",
-        "content_nature":    "[검수용] content_nature",
-        "benefit_type":      "[검수용] benefit_type",
-        "error_flag":        "[검수용] error_flag",
-        "needs_review":      "[검수용] needs_review",
-        "validation_notes":  "[검수용] validation_notes",
-        "review_score":      "[검수용] review_score",
-        "review_verdict":    "[검수용] review_verdict",
-        "review_notes":      "[검수용] review_notes",
-        "review_issues":     "[검수용] review_issues",
-    }
-    result_df = result_df.rename(columns=rename_map)
-
+    out = result_df.rename(columns=_OUTPUT_RENAME_MAP)
     for col in OUTPUT_COLUMNS:
-        if col not in result_df.columns:
-            result_df[col] = ""
+        if col not in out.columns:
+            out[col] = ""
 
-    result_df[OUTPUT_COLUMNS].to_csv(path, index=False, encoding="utf-8-sig")
+    out[OUTPUT_COLUMNS].to_csv(path, index=False, encoding="utf-8-sig")
     logger.info(f"최종 산출물 저장: {path}")
     return path
 
@@ -392,8 +380,10 @@ def print_summary(result_df: pd.DataFrame, send_dt: str, output_path: Path,
                   selection_report_path: Path = None):
     total   = len(result_df)
     v1_ok   = result_df["contents"].notna().sum() if "contents" in result_df.columns else 0
-    errors  = int(result_df.get("[검수용] error_flag", result_df.get("error_flag", pd.Series([False]*total))).sum())
-    reviews = int(result_df.get("[검수용] needs_review", result_df.get("needs_review", pd.Series([False]*total))).sum())
+    err_col = "[검수용] error_flag" if "[검수용] error_flag" in result_df.columns else "error_flag"
+    rev_col = "[검수용] needs_review" if "[검수용] needs_review" in result_df.columns else "needs_review"
+    errors  = int(result_df[err_col].sum()) if err_col in result_df.columns else 0
+    reviews = int(result_df[rev_col].sum()) if rev_col in result_df.columns else 0
 
     needs_review_ids = []
     flag_col = "[검수용] needs_review" if "[검수용] needs_review" in result_df.columns else "needs_review"
@@ -437,28 +427,7 @@ def save_final_range(result_df: pd.DataFrame, date_from: str, date_to: str) -> P
     d_t   = date_to.replace("-", "")
     path  = OUTPUT_DIR / f"campaign_meta_{d_f}_{d_t}_{ts}.csv"
 
-    rename_map = {
-        "contents_v1":       "[검수용] contents_v1_benefit",
-        "contents_v2":       "[검수용] contents_v2_brand",
-        "contents_v3":       "[검수용] contents_v3_best",
-        "contents_source":   "[검수용] contents_source",
-        "brand_nm_verified": "[검수용] brand_nm_verified",
-        "title_source":      "[검수용] title_source",
-        "confidence_v1":     "[검수용] confidence_v1",
-        "confidence_v2":     "[검수용] confidence_v2",
-        "confidence_v3":     "[검수용] confidence_v3",
-        "content_nature":    "[검수용] content_nature",
-        "benefit_type":      "[검수용] benefit_type",
-        "error_flag":        "[검수용] error_flag",
-        "needs_review":      "[검수용] needs_review",
-        "validation_notes":  "[검수용] validation_notes",
-        "review_score":      "[검수용] review_score",
-        "review_verdict":    "[검수용] review_verdict",
-        "review_notes":      "[검수용] review_notes",
-        "review_issues":     "[검수용] review_issues",
-    }
-    out = result_df.rename(columns=rename_map)
-
+    out = result_df.rename(columns=_OUTPUT_RENAME_MAP)
     for col in OUTPUT_COLUMNS:
         if col not in out.columns:
             out[col] = ""
@@ -632,7 +601,7 @@ def run_range(
         print(f"\n⚠️  검수 필요 항목 (id): {needs_review_ids[:10]}")
     print(f"{'='*60}\n")
 
-    run_log.print_log_summary(log_path)
+    run_log.print_log_summary()
 
 
 def _next_monday() -> str:
@@ -748,7 +717,7 @@ def main():
             logger.warning("선별 소재 0건 — 처리 종료")
             print("\n⚠️  선별된 소재가 없습니다. 입력 파일과 발송일을 확인하세요.")
             log_path = run_log.finalize(None)
-            run_log.print_log_summary(log_path)
+            run_log.print_log_summary()
             return
 
         save_pipeline1(selected_df, send_dt)
@@ -756,7 +725,7 @@ def main():
 
         if args.stage == "pipeline1":
             log_path = run_log.finalize(None)
-            run_log.print_log_summary(log_path)
+            run_log.print_log_summary()
             logger.info(f"Pipeline 1 완료 — 선별 리포트: {selection_report_path}")
             return
 
@@ -812,7 +781,7 @@ def main():
     save_processed_urls(result_df, send_dt)
     log_path    = run_log.finalize(str(output_path))
     print_summary(result_df, send_dt, output_path, selection_report_path)
-    run_log.print_log_summary(log_path)
+    run_log.print_log_summary()
 
 
 if __name__ == "__main__":

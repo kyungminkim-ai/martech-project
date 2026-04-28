@@ -5,6 +5,7 @@
 warning/fail 판정 시 needs_review 플래그를 상향한다.
 """
 import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 from llm_client import review_message, set_current_row
 from rules import lookup_brand_name
@@ -13,34 +14,46 @@ logger = logging.getLogger(__name__)
 
 VERDICT_FAIL = "fail"
 VERDICT_WARN = "warning"
+_MAX_WORKERS = 6
 
 
 def run_pipeline4(result_df: pd.DataFrame, brand_df: pd.DataFrame) -> pd.DataFrame:
     logger.info(f"Pipeline 4 시작 — {len(result_df)}건 LLM 검토")
 
-    scores, verdicts, notes_list, issues_list = [], [], [], []
+    total = len(result_df)
+    rows_indexed = list(result_df.iterrows())
 
-    for i, (_, row) in enumerate(result_df.iterrows(), 1):
+    def _review(args):
+        i, (_, row) = args
         row_id     = str(row.get("id", f"idx-{i}"))
         set_current_row(row_id)
         brand_id   = str(row.get("brand_id", "") or "")
         brand_name = lookup_brand_name(brand_id, brand_df)
-        promo      = str(row.get("promotion_content", "") or "")
-        title      = str(row.get("title", "") or "")
-        v1         = str(row.get("contents_v1", "") or "")
-        v2         = str(row.get("contents_v2", "") or "")
-        v3         = str(row.get("contents_v3", "") or "")
-        target     = str(row.get("target", "") or "")
+        result = review_message(
+            title    = str(row.get("title", "") or ""),
+            contents = str(row.get("contents", "") or ""),
+            brand    = brand_name,
+            promotion_content = str(row.get("promotion_content", "") or ""),
+            target   = str(row.get("target", "") or ""),
+        )
+        return i, result
 
-        result = review_message(title, v1, v2, brand_name, promo, target, contents_v3=v3)
+    result_map: dict = {}
+    with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as executor:
+        futures = {executor.submit(_review, (i, item)): i for i, item in enumerate(rows_indexed, 1)}
+        for future in as_completed(futures):
+            i, result = future.result()
+            result_map[i] = result
+            if i % 10 == 0:
+                logger.info(f"  진행: {i}/{total}")
 
-        scores.append(result.get("score"))
-        verdicts.append(result.get("verdict", VERDICT_WARN))
-        notes_list.append(result.get("notes", ""))
-        issues_list.append(", ".join(result.get("issues", [])))
-
-        if i % 10 == 0:
-            logger.info(f"  진행: {i}/{len(result_df)}")
+    scores, verdicts, notes_list, issues_list = [], [], [], []
+    for i in range(1, total + 1):
+        r = result_map.get(i, {})
+        scores.append(r.get("score"))
+        verdicts.append(r.get("verdict", VERDICT_WARN))
+        notes_list.append(r.get("notes", ""))
+        issues_list.append(", ".join(r.get("issues", [])))
 
     df = result_df.copy()
     df["review_score"]   = scores
