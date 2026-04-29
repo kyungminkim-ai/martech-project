@@ -34,7 +34,7 @@ WITH base_data AS (
                          'ARRAY<STRUCT<sourceBrandId: STRING>>')                                   AS ad_data
         FROM ocmp.marketing_slot.application
         WHERE marketing_inventory_id IN (2, 26, 89, 90, 91, 58)
-          AND DATE(release_start_date_time) = '{send_dt}'
+          AND DATE(release_start_date_time) BETWEEN '{date_from}' AND '{date_to}'
     )
     LATERAL VIEW OUTER explode(data)              AS groups
     LATERAL VIEW OUTER explode(groups.attributes) AS attr

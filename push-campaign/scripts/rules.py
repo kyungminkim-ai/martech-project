@@ -41,6 +41,21 @@ def _parse_release_dt(release_dt) -> Optional[datetime]:
     return None
 
 
+def compute_send_dt(row) -> Optional[str]:
+    """release_start_date_time 기반으로 발송예정일(send_dt) 계산.
+
+    - 전사캠페인 / 카테고리마케팅: date(release_start_date_time)
+    - 그 외 모든 팀: date(release_start_date_time) + 1일
+    """
+    team_name = str(row.get("register_team_name", "") or "")
+    dt = _parse_release_dt(row.get("release_start_date_time"))
+    if dt is None:
+        return None
+    if any(kw in team_name for kw in MARKETING_TEAM_KEYWORDS):
+        return dt.strftime("%Y-%m-%d")
+    return (dt + timedelta(days=1)).strftime("%Y-%m-%d")
+
+
 def is_in_send_window(release_dt, send_dt: str) -> bool:
     """발송 윈도우 체크: D-1 10:00 <= release_dt < D-0 10:00 (SEND_WINDOW_DAYS 기준)."""
     dt = _parse_release_dt(release_dt)
@@ -373,6 +388,23 @@ def title_has_collab_pair(title: str, collab_pair: str) -> bool:
     parts = [p.strip() for p in re.split(r'\s*[Xx×]\s*', collab_pair) if p.strip()]
     title_flat = (title or "").replace(" ", "")
     return all(p.replace(" ", "") in title_flat for p in parts)
+
+
+def _normalize_collab_str(text: str) -> str:
+    """콜라보 exact-match 비교용 정규화: 공백 제거, X/× → x 소문자 변환."""
+    return re.sub(r'\s', '', (text or "")).replace('X', 'x').replace('×', 'x')
+
+
+def title_is_clean_collab_pair(title: str, collab_pair: str) -> bool:
+    """콜라보 소재 제목이 정확히 'BrandA x BrandB' 형식인지 검증.
+
+    collab_pair가 없으면 True (비콜라보 소재는 이 조건 적용 안 함).
+    제목에 collab_pair 이외의 추가 텍스트가 있으면 False → LLM 재생성 대상.
+    x는 반드시 소문자여야 하며, 공백 차이는 무시한다.
+    """
+    if not collab_pair:
+        return True
+    return _normalize_collab_str(title) == _normalize_collab_str(collab_pair)
 
 
 def extract_title_keywords(title: str, collab_pair: str = "") -> list:

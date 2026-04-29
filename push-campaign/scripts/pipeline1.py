@@ -7,7 +7,7 @@ from config import (
     GOOGLE_SHEET_ID, GOOGLE_SHEET_CREDS, GOOGLE_SHEET_CAMPAIGN_META_GID,
     GOOGLE_SHEETS_ENABLED,
 )
-from rules import is_cancelled, is_in_send_window, is_already_selected, make_sheet_key, validate_landing_url
+from rules import is_cancelled, is_already_selected, make_sheet_key, validate_landing_url
 from run_logger import (
     REASON_CANCELLED, REASON_ALREADY_SELECTED,
     REASON_ALREADY_PROC, REASON_URL_ALREADY_SENT,
@@ -15,7 +15,7 @@ from run_logger import (
     REASON_LANDING_NOT_OPEN, REASON_LANDING_OPEN,
 )
 
-_CAMPAIGN_TEAM_KEYWORD = "전사캠페인"
+_CAMPAIGN_TEAM_KEYWORDS = ["전사캠페인", "카테고리마케팅"]
 
 logger = logging.getLogger(__name__)
 
@@ -125,8 +125,8 @@ def apply_selection(
         ad_status = row.get(AD_STATUS_COLUMN)
         sheet_key = make_sheet_key(url, brand_id, send_dt)
 
-        # ── 전사캠페인 전용 로직 ───────────────────────────────────────────
-        if _CAMPAIGN_TEAM_KEYWORD in team_name:
+        # ── 전사캠페인 / 카테고리마케팅 전용 로직 ────────────────────────────
+        if any(kw in team_name for kw in _CAMPAIGN_TEAM_KEYWORDS):
             # 조건 1: 취소 여부 (전사캠페인도 취소는 제외)
             if is_cancelled(remarks):
                 results.append({
@@ -227,17 +227,7 @@ def apply_selection(
             })
             continue
 
-        # 조건 6: 발송 윈도우 (D-1 10:00 ~ D-0 10:00)
-        if not is_in_send_window(release, send_dt):
-            results.append({
-                "selected": False,
-                "selection_reason": None,
-                "rejection_reason": REASON_LANDING_NOT_OPEN,
-                "rejection_detail": f"release={str(release)[:30]}",
-            })
-            continue
-
-        # 조건 7: 랜딩 URL 유효성 검증
+        # 조건 6: 랜딩 URL 유효성 검증
         url_reason = validate_landing_url(url)
         if url_reason:
             results.append({

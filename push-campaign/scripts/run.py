@@ -36,7 +36,7 @@ from pipeline2 import run_pipeline2
 from pipeline3 import run_pipeline3
 from pipeline4 import run_pipeline4
 from pipeline5 import run_pipeline5
-from rules import is_title_valid, lookup_brand_name
+from rules import is_title_valid, lookup_brand_name, compute_send_dt
 from run_logger import RunLogger, URL_REJECTION_CODES, REASON_CAMPAIGN_META_REGISTERED
 
 logging.basicConfig(
@@ -51,15 +51,15 @@ OUTPUT_COLUMNS = [
     "send_dt", "send_time", "target", "priority", "ad_code",
     "content_type", "goods_id", "category_id", "brand_id", "team_id",
     "braze_campaign_name", "title", "contents", "landing_url", "image_url",
-    "push_url", "feed_url", "webhook_contents",
     # 검수용 컬럼 (담당자 검토용 — Braze 등록 시 제외)
+    "[검수용] review_notes",
     "[검수용] brand_nm_verified",
     "[검수용] title_source", "[검수용] confidence",
     "[검수용] content_nature", "[검수용] benefit_type",
     "[검수용] error_flag", "[검수용] needs_review",
     "[검수용] validation_notes",
     "[검수용] review_score", "[검수용] review_verdict",
-    "[검수용] review_notes", "[검수용] review_issues",
+    "[검수용] review_issues",
 ]
 
 # rename_map: pipeline 내부 컬럼명 → 출력 CSV 컬럼명
@@ -134,14 +134,20 @@ def _check_databricks() -> bool:
         return False
 
 
-def _fetch_bizest_from_databricks(send_dt: str) -> pd.DataFrame:
-    """Databricks에서 bizest RAW 데이터를 날짜별로 조회."""
+def _fetch_bizest_from_databricks(date_from: str, date_to: str = None) -> pd.DataFrame:
+    """Databricks에서 bizest RAW 데이터를 날짜 범위로 조회.
+
+    date_to가 None이면 date_from 단일 날짜만 조회.
+    """
     from databricks import sql as dbsql
 
-    query_template = BIZEST_SQL_PATH.read_text(encoding="utf-8")
-    query = query_template.replace("{send_dt}", send_dt)
+    if date_to is None:
+        date_to = date_from
 
-    logger.info(f"Databricks 조회 시작: send_dt={send_dt}")
+    query_template = BIZEST_SQL_PATH.read_text(encoding="utf-8")
+    query = query_template.replace("{date_from}", date_from).replace("{date_to}", date_to)
+
+    logger.info(f"Databricks 조회 시작: {date_from} ~ {date_to}")
     conn = dbsql.connect(
         server_hostname=DATABRICKS_HOST,
         http_path=DATABRICKS_HTTP_PATH,
@@ -192,6 +198,18 @@ def load_inputs(raw_path: Path, brand_path: Path, source: str = "file"):
         logger.warning(f"카테고리 목록 없음: {CATEGORY_SEL_PATH}")
 
     return raw_df, brand_df, category_df
+
+
+def _add_computed_send_dt(df: pd.DataFrame) -> pd.DataFrame:
+    """release_start_date_time 기반으로 send_dt를 행별로 계산해 컬럼으로 추가.
+
+    - 전사캠페인 / 카테고리마케팅: date(release_start_date_time)
+    - 그 외: date(release_start_date_time) + 1일
+    Null이면 해당 행을 어느 날짜 배치에도 포함시키지 않는다.
+    """
+    df = df.copy()
+    df["send_dt"] = df.apply(compute_send_dt, axis=1)
+    return df
 
 
 def save_pipeline1(selected_df: pd.DataFrame, send_dt: str):
@@ -336,6 +354,8 @@ def save_weekly_report(all_candidates: list, week_start: str) -> Path:
 def run_weekly(week_dates: list, raw_path: Path, brand_path: Path) -> None:
     """주단위 소재 선별 — 날짜간 중복 제거 후 통합 후보군 리포트 생성."""
     raw_df_base, _, _ = load_inputs(raw_path, brand_path)
+    # send_dt를 release_start_date_time 기반으로 행별 계산
+    raw_df_base = _add_computed_send_dt(raw_df_base)
     week_start = week_dates[0]
 
     campaign_meta_map, campaign_meta_date_url_set = load_campaign_meta_sync()
@@ -349,8 +369,7 @@ def run_weekly(week_dates: list, raw_path: Path, brand_path: Path) -> None:
     print(f"{'='*60}\n")
 
     for send_dt in week_dates:
-        raw_df = raw_df_base.copy()
-        raw_df["send_dt"] = send_dt
+        raw_df = raw_df_base[raw_df_base["send_dt"] == send_dt].copy()
 
         selected_df, rejected_df = run_pipeline1(
             raw_df, send_dt,
@@ -526,6 +545,109 @@ def print_summary(result_df: pd.DataFrame, send_dt: str, output_path: Path,
     print("="*60 + "\n")
 
 
+def _ensure_llm_ready(
+    selected_df: pd.DataFrame,
+    brand_df: pd.DataFrame,
+    send_dt_key: str,
+    date_from: str,
+    date_to: str,
+) -> bool:
+    """LLM 사용 가능 여부 확인 후, 불가 시 pending_jobs 생성 및 False 반환.
+
+    Returns:
+        True  — LLM(API 또는 파일 모드) 사용 가능, Pipeline 2 진행 OK
+        False — Claude Code 모드 필요, 호출자는 즉시 return해야 한다
+    """
+    # 이미 파일 모드 응답 로드된 경우
+    if llm_client._file_responses is not None:
+        return True
+
+    # API 키 없음
+    if not LLM_API_AVAILABLE:
+        responses_path = get_responses_path(send_dt_key)
+        if responses_path.exists():
+            with open(responses_path, encoding="utf-8") as f:
+                llm_client.init_file_mode(json.load(f))
+            logger.info(f"Claude Code 모드 — 응답 파일 로드: {responses_path}")
+            return True
+        # 응답 파일 없음 → pending_jobs 생성
+        _emit_pending_jobs(selected_df, brand_df, send_dt_key, date_from, date_to)
+        return False
+
+    # API 키 있으나 실제 호출 가능한지 검증
+    if not llm_client.test_api_available():
+        responses_path = get_responses_path(send_dt_key)
+        if responses_path.exists():
+            with open(responses_path, encoding="utf-8") as f:
+                llm_client.init_file_mode(json.load(f))
+            logger.info(f"API 실패 → 응답 파일 폴백: {responses_path}")
+            return True
+        _emit_pending_jobs(selected_df, brand_df, send_dt_key, date_from, date_to)
+        return False
+
+    return True
+
+
+def _emit_pending_jobs(
+    selected_df: pd.DataFrame,
+    brand_df: pd.DataFrame,
+    send_dt_key: str,
+    date_from: str,
+    date_to: str,
+) -> None:
+    """pending_jobs JSON을 생성하고 Claude Code 모드 안내 메시지를 출력."""
+    d_f = date_from.replace("-", "")
+    d_t = date_to.replace("-", "")
+
+    jobs = []
+    for _, row in selected_df.iterrows():
+        brand_id   = str(row.get("sourceBrandId", "") or "")
+        brand      = lookup_brand_name(brand_id, brand_df)
+        orig_title = str(row.get("main_title", "") or "")
+        jobs.append({
+            "id":                str(row.get("id", "")),
+            "send_dt":           str(row.get("send_dt", "")),
+            "brand":             brand,
+            "promotion_content": str(row.get("promotion_content", "") or ""),
+            "target":            str(row.get("register_team_name", "") or ""),
+            "content_type":      str(row.get("landing_url", "") or ""),
+            "original_title":    orig_title,
+            "needs_title_regen": not is_title_valid(orig_title),
+            "remarks":           str(row.get("remarks", "") or ""),
+        })
+
+    response_filename = f"llm_responses_{send_dt_key}.json"
+    payload = {
+        "date_from": date_from, "date_to": date_to,
+        "total": len(jobs),
+        "generated_at": datetime.now().isoformat(),
+        "instructions": _build_pending_instructions(response_filename),
+        "message_rules": _PENDING_JOBS_MESSAGE_RULES,
+        "jobs": jobs,
+    }
+
+    jobs_path = get_pending_jobs_path(send_dt_key)
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    with open(jobs_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    responses_path = get_responses_path(send_dt_key)
+    logger.info(f"Pending jobs 저장: {jobs_path} ({len(jobs)}건)")
+
+    print("\n" + "=" * 60)
+    if not LLM_API_AVAILABLE:
+        print("⚠️  ANTHROPIC_API_KEY 미설정 — Claude Code 모드")
+    else:
+        print("⚠️  API 키 설정됨 but 호출 실패 — Claude Code 모드로 전환")
+    print(f"📋 Pending jobs: {jobs_path}")
+    print(f"응답 저장 위치: {responses_path}")
+    if date_from == date_to:
+        print(f"완료 후 재실행: python3 scripts/run.py --date {date_from}")
+    else:
+        print(f"완료 후 재실행: python3 scripts/run.py --from {date_from} --to {date_to}")
+    print("=" * 60 + "\n")
+
+
 def _dates_in_range(date_from: str, date_to: str) -> list:
     """date_from ~ date_to 사이 날짜 목록 반환 (양 끝 포함)."""
     d_from = datetime.strptime(date_from, "%Y-%m-%d")
@@ -581,13 +703,17 @@ def run_range(
     # ── Phase 1: 날짜별 Pipeline 1 ──────────────────────────────────────
     run_log = RunLogger(send_dt=f"{date_from}~{date_to}", input_file=str(raw_path))
 
+    # Databricks 모드: date_from -1일부터 date_to까지 한 번에 조회 후 send_dt 계산
+    if databricks_mode:
+        date_from_ext = (datetime.strptime(date_from, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+        raw_df_base = _fetch_bizest_from_databricks(date_from_ext, date_to)
+        logger.info(f"Databricks 조회 범위: {date_from_ext} ~ {date_to} ({len(raw_df_base)}건)")
+
+    # 파일/Databricks 공통: send_dt를 release_start_date_time 기반으로 행별 계산
+    raw_df_base = _add_computed_send_dt(raw_df_base)
+
     for send_dt in dates:
-        if databricks_mode:
-            raw_df = _fetch_bizest_from_databricks(send_dt)
-            raw_df["send_dt"] = send_dt
-        else:
-            raw_df = raw_df_base.copy()
-            raw_df["send_dt"] = send_dt
+        raw_df = raw_df_base[raw_df_base["send_dt"] == send_dt].copy()
 
         selected_df, rejected_df = run_pipeline1(
             raw_df, send_dt,
@@ -644,54 +770,9 @@ def run_range(
     total_selected = len(combined_selected)
     print(f"\n  → 총 통과: {total_selected}건 ({date_from}~{date_to})")
 
-    # ── Phase 2: API 키 없을 때 응답 파일 자동 탐지 → 없으면 pending_jobs 생성 ──
-    if not LLM_API_AVAILABLE and llm_client._file_responses is None:
-        responses_path = get_responses_path(f"{d_f}_{d_t}")
-        if responses_path.exists():
-            with open(responses_path, encoding="utf-8") as f:
-                llm_client.init_file_mode(json.load(f))
-            logger.info(f"Claude Code 모드 — 범위 응답 파일 로드: {responses_path}")
-
-    if not LLM_API_AVAILABLE and llm_client._file_responses is None:
-        # 응답 파일 없음 → pending_jobs 생성 후 중단
-        range_key = f"{d_f}_{d_t}"
-        jobs_path = get_pending_jobs_path(range_key)
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        jobs = []
-        for _, row in combined_selected.iterrows():
-            brand_id = str(row.get("sourceBrandId", "") or "")
-            brand    = lookup_brand_name(brand_id, brand_df)
-            orig_title = str(row.get("main_title", "") or "")
-            remarks_raw = str(row.get("remarks", "") or "")
-            jobs.append({
-                "id":                str(row.get("id", "")),
-                "send_dt":           str(row.get("send_dt", "")),
-                "brand":             brand,
-                "promotion_content": str(row.get("promotion_content", "") or ""),
-                "target":            str(row.get("register_team_name", "") or ""),
-                "content_type":      str(row.get("landing_url", "") or ""),
-                "original_title":    orig_title,
-                "needs_title_regen": not is_title_valid(orig_title),
-                "remarks":           remarks_raw,
-            })
-        response_filename = f"llm_responses_{range_key}.json"
-        payload = {
-            "date_from": date_from, "date_to": date_to,
-            "total": len(jobs),
-            "generated_at": datetime.now().isoformat(),
-            "instructions": _build_pending_instructions(response_filename),
-            "message_rules": _PENDING_JOBS_MESSAGE_RULES,
-            "jobs": jobs,
-        }
-        with open(jobs_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False, indent=2)
-        responses_path = get_responses_path(range_key)
-        print("\n" + "="*60)
-        print("⚠️  ANTHROPIC_API_KEY 미설정 — Claude Code 모드")
-        print(f"📋 Pending jobs: {jobs_path}")
-        print(f"응답 저장 위치: {responses_path}")
-        print(f"완료 후 재실행: python3 scripts/run.py --from {date_from} --to {date_to}")
-        print("="*60 + "\n")
+    # ── Phase 2: LLM 준비 확인 (API 불가 시 Claude Code 모드로 전환) ──────
+    range_key = f"{d_f}_{d_t}"
+    if not _ensure_llm_ready(combined_selected, brand_df, range_key, date_from, date_to):
         return
 
     # ── Phase 3: Pipeline 2~4 통합 실행 ────────────────────────────────
@@ -792,15 +873,7 @@ def run_from_selection_report(
     print(f"[from-selection-report] {date_from} ~ {date_to} ({len(selected_df)}건)")
     print(f"{'='*60}\n")
 
-    # 4. LLM 응답 파일 자동 탐지 (API 키 없을 때)
-    if not LLM_API_AVAILABLE and llm_client._file_responses is None:
-        rp = get_responses_path(f"{d_f}_{d_t}")
-        if rp.exists():
-            with open(rp, encoding="utf-8") as f:
-                llm_client.init_file_mode(json.load(f))
-            logger.info(f"Claude Code 모드 — 응답 파일 자동 로드: {rp}")
-
-    # 5. brand / category 로드
+    # 4. brand / category 로드
     brand_df = pd.DataFrame()
     if brand_path.exists():
         brand_df = pd.read_csv(brand_path, dtype={"brand_id": str})
@@ -812,19 +885,13 @@ def run_from_selection_report(
         except Exception:
             pass
 
-    # 6. API 키 없고 응답 파일도 없으면 pending_jobs 재생성 후 중단
-    if not LLM_API_AVAILABLE and llm_client._file_responses is None:
-        jobs_path = generate_pending_jobs(selected_df, brand_df, date_from)
-        responses_path = get_responses_path(f"{d_f}_{d_t}")
-        print("\n" + "="*60)
-        print("⚠️  ANTHROPIC_API_KEY 미설정 — Claude Code 모드")
-        print(f"📋 Pending jobs: {jobs_path}")
-        print(f"응답 저장 위치: {responses_path}")
+    # 5. LLM 준비 확인 (API 불가 시 Claude Code 모드로 전환)
+    range_key = f"{d_f}_{d_t}"
+    if not _ensure_llm_ready(selected_df, brand_df, range_key, date_from, date_to):
         print(f"완료 후 재실행: python3 scripts/run.py --from-selection-report {report_path}")
-        print("="*60 + "\n")
         return
 
-    # 7. P2~P5 실행
+    # 6. P2~P5 실행
     run_log = RunLogger(send_dt=f"{d_f}_{d_t}", input_file=str(report_path))
 
     result_df = run_pipeline2(selected_df, brand_df, category_df, send_dt=f"{d_f}_{d_t}")
@@ -949,7 +1016,7 @@ def main():
         if not (args.date_from and args.date_to):
             logger.error("--from 과 --to 를 함께 지정해야 합니다.")
             sys.exit(1)
-        # 범위 응답 파일 명시 지정
+        # 응답 파일 명시 지정 시 미리 로드
         if args.from_responses:
             rp = Path(args.from_responses)
             if not rp.exists():
@@ -958,14 +1025,6 @@ def main():
             with open(rp, encoding="utf-8") as f:
                 llm_client.init_file_mode(json.load(f))
             logger.info(f"Claude Code 모드 — 응답 파일 로드: {rp}")
-        else:
-            d_f = args.date_from.replace("-", "")
-            d_t = args.date_to.replace("-", "")
-            rp  = get_responses_path(f"{d_f}_{d_t}")
-            if rp.exists():
-                with open(rp, encoding="utf-8") as f:
-                    llm_client.init_file_mode(json.load(f))
-                logger.info(f"Claude Code 모드 — 범위 응답 파일 자동 로드: {rp}")
         run_range(args.date_from, args.date_to, raw_path, brand_path, source=source)
         return
 
@@ -985,13 +1044,18 @@ def main():
 
     logger.info(f"실행 시작 — send_dt={send_dt}, stage={args.stage}")
 
+    send_dt_minus_1 = (datetime.strptime(send_dt, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+
     if databricks_mode:
-        raw_df = _fetch_bizest_from_databricks(send_dt)
-        raw_df["send_dt"] = send_dt
+        # date_from-1 ~ date_from 범위로 조회해 send_dt 계산 후 필터
+        raw_df_all = _fetch_bizest_from_databricks(send_dt_minus_1, send_dt)
+        raw_df_all = _add_computed_send_dt(raw_df_all)
+        raw_df = raw_df_all[raw_df_all["send_dt"] == send_dt].copy()
         _, brand_df, category_df = load_inputs(raw_path, brand_path, source="file")
     else:
-        raw_df, brand_df, category_df = load_inputs(raw_path, brand_path, source="file")
-        raw_df["send_dt"] = send_dt
+        raw_df_all, brand_df, category_df = load_inputs(raw_path, brand_path, source="file")
+        raw_df_all = _add_computed_send_dt(raw_df_all)
+        raw_df = raw_df_all[raw_df_all["send_dt"] == send_dt].copy()
 
     # ── LLM 모드 결정 ─────────────────────────────────────────────────
     if args.from_responses:
@@ -1002,14 +1066,6 @@ def main():
         with open(responses_path, encoding="utf-8") as f:
             llm_client.init_file_mode(json.load(f))
         logger.info(f"Claude Code 모드 — 응답 파일 로드: {responses_path}")
-    elif not LLM_API_AVAILABLE:
-        responses_path = get_responses_path(send_dt)
-        if responses_path.exists():
-            with open(responses_path, encoding="utf-8") as f:
-                llm_client.init_file_mode(json.load(f))
-            logger.info(f"Claude Code 모드 — 응답 파일 자동 로드: {responses_path}")
-        else:
-            logger.warning("ANTHROPIC_API_KEY 미설정 — Pipeline 1만 실행 후 pending_jobs 생성")
 
     run_log = RunLogger(send_dt=send_dt, input_file=str(raw_path))
     selection_report_path = None
@@ -1045,19 +1101,8 @@ def main():
             logger.info(f"Pipeline 1 완료 — 선별 리포트: {selection_report_path}")
             return
 
-        # API 키 없고 응답 파일도 없으면 pending_jobs 생성 후 종료
-        if not LLM_API_AVAILABLE and llm_client._file_responses is None:
-            jobs_path = generate_pending_jobs(selected_df, brand_df, send_dt)
-            print("\n" + "="*60)
-            print("⚠️  ANTHROPIC_API_KEY 미설정 — Claude Code 모드로 전환하세요")
-            print("="*60)
-            print(f"\n📋 생성된 작업 파일: {jobs_path}")
-            print("\n다음 단계:")
-            print("  1. Claude Code에게 아래 파일을 열어 LLM 응답을 생성해달라고 요청하세요:")
-            print(f"     {jobs_path}")
-            print(f"  2. 응답 파일 저장 위치: {get_responses_path(send_dt)}")
-            print(f"  3. 완료 후 재실행: python3 scripts/run.py --date {send_dt}")
-            print("="*60 + "\n")
+        # LLM 준비 확인 (API 불가 시 Claude Code 모드로 전환)
+        if not _ensure_llm_ready(selected_df, brand_df, send_dt, send_dt, send_dt):
             log_path = run_log.finalize(None)
             return
 

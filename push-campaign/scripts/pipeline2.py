@@ -15,7 +15,7 @@ from rules import (
     append_unsubscribe, lookup_brand_name, build_category_list_str,
     build_braze_campaign_name, build_feed_url, build_webhook_contents,
     extract_goods_id, extract_title_keywords,
-    detect_collab_pair, title_has_collab_pair,
+    detect_collab_pair, title_is_clean_collab_pair,
     detect_content_nature, detect_benefit_type,
 )
 from llm_client import regenerate_title, generate_content, set_current_row, infer_category_ids
@@ -145,9 +145,10 @@ def process_row(row: pd.Series, brand_df: pd.DataFrame, ad_code: str, category_d
     # 1) 40자 초과 시 쉼표 앞 훅 부분 추출 시도
     candidate_title = _trim_long_title(original_title)
 
-    # 2) 콜라보 소재는 제목에 "BrandA X BrandB" 쌍이 반드시 있어야 유효
+    # 2) 콜라보 소재는 제목이 "BrandA x BrandB" 와 정확히 일치해야 유효
+    #    추가 텍스트(발매·무신사·혜택 등) 포함 시 LLM 재생성
     _title_format_ok  = is_title_valid(candidate_title)
-    _title_collab_ok  = title_has_collab_pair(candidate_title, collab_pair)
+    _title_collab_ok  = title_is_clean_collab_pair(candidate_title, collab_pair)
 
     if _title_format_ok and _title_collab_ok:
         result["title"]        = candidate_title

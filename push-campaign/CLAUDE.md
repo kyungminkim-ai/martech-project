@@ -138,7 +138,7 @@
 
 | 컬럼 | 조건 | 규격 |
 |------|------|------|
-| `title` | `main_title`이 5~40자이면 원본 사용 (40자 초과 시 쉼표 앞 훅 부분 추출), 그 외 LLM 재생성 | 5~40자, 명사형 종결 |
+| `title` | `main_title`이 5~40자이면 원본 사용 (40자 초과 시 쉼표 앞 훅 부분 추출), 그 외 LLM 재생성. **콜라보 소재는 제목이 정확히 "BrandA x BrandB" 형식(x 소문자, 추가 텍스트 없음)이어야 원본 사용** — 아닐 경우 LLM 재생성 | 5~40자, 명사형 종결 |
 | `contents` | 모든 선정 소재 — 단일 LLM 호출로 혜택·감성 균형 생성 | `(광고) ` 시작, 25~60자, 명사형 종결 |
 
 ### 제목-본문 이어쓰기 원칙
@@ -162,21 +162,22 @@
 id,
 send_dt, send_time, target, priority, ad_code, content_type,
 goods_id, category_id, brand_id, team_id, braze_campaign_name,
-title, contents, landing_url, image_url,
-push_url, feed_url, webhook_contents
+title, contents, landing_url, image_url
 ```
 
 **검수용 컬럼 (담당자 검토 후 Braze 등록 시 제외):**
 ```
+[검수용] review_notes,
 [검수용] brand_nm_verified,
 [검수용] title_source, [검수용] confidence,
 [검수용] content_nature, [검수용] benefit_type,
 [검수용] error_flag, [검수용] needs_review, [검수용] validation_notes,
 [검수용] review_score, [검수용] review_verdict,
-[검수용] review_notes, [검수용] review_issues
+[검수용] review_issues
 ```
 
-> `goods_id`, `team_id`, `braze_campaign_name`, `feed_url`, `webhook_contents`, `stopped`은 자동화 대상 외 컬럼 — 공란 또는 시트 내 함수 처리
+> `goods_id`, `team_id`, `braze_campaign_name`, `stopped`은 자동화 대상 외 컬럼 — 공란 또는 시트 내 함수 처리
+> `push_url`, `feed_url`, `webhook_contents`는 내부 계산에만 사용하며 CSV 출력에서 제외
 
 ---
 

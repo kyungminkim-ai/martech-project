@@ -23,6 +23,8 @@ _client: Optional[anthropic.Anthropic] = None
 _file_responses: Optional[dict] = None
 # threading.local()로 스레드별 row_id 격리 — 전역 공유 시 병렬 처리에서 race condition 발생
 _thread_local = threading.local()
+# API 키가 설정됐지만 실제 호출이 실패한 경우 True — _call_claude가 즉시 None 반환
+_api_unavailable: bool = False
 
 
 def init_file_mode(responses: dict) -> None:
@@ -50,10 +52,30 @@ def get_client() -> anthropic.Anthropic:
     return _client
 
 
+def test_api_available() -> bool:
+    """API 키가 실제로 유효한지 최소 비용으로 확인. 실패 시 _api_unavailable=True 설정."""
+    global _api_unavailable
+    from config import LLM_API_AVAILABLE, LLM_MODEL
+    if not LLM_API_AVAILABLE:
+        return False
+    try:
+        client = get_client()
+        client.messages.create(
+            model=LLM_MODEL,
+            max_tokens=1,
+            messages=[{"role": "user", "content": "1"}],
+        )
+        return True
+    except Exception as e:
+        logger.warning(f"API 테스트 실패 — Claude Code 모드로 전환: {e}")
+        _api_unavailable = True
+        return False
+
+
 def _call_claude(system_prompt: str, user_prompt: str) -> Optional[str]:
     """system_prompt는 cache_control로 캐시되고, user_prompt는 매 호출마다 새로 전송된다."""
     from config import LLM_API_AVAILABLE
-    if not LLM_API_AVAILABLE:
+    if not LLM_API_AVAILABLE or _api_unavailable:
         return None
     client = get_client()
     for attempt in range(LLM_MAX_RETRIES):
