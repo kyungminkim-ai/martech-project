@@ -217,6 +217,10 @@ def _check_row(row: pd.Series, seen_ad_codes: set, brand_df: Optional[pd.DataFra
     if title and contents and _check_title_body_overlap(title, contents, collab_pair):
         issues.append("title_body_overlap_in_contents")
 
+    # ── 19. 콜라보 제목 구분자 대소문자 검사 ────────────────────────────
+    if re.search(r'\s[X×]\s', title):
+        issues.append("collab_separator_not_lowercase_x")
+
     # ── 17. 할인율 정합성 검증 ───────────────────────────────────────────
     promotion_content = str(row.get("promotion_content", "") or "")
     raw_rates = _extract_discount_rates(promotion_content)

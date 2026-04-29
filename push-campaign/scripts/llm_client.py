@@ -3,6 +3,7 @@ import json
 import time
 import re
 import logging
+import threading
 from typing import Optional
 import anthropic
 from config import LLM_MODEL, LLM_MAX_TOKENS, LLM_MAX_RETRIES
@@ -20,7 +21,8 @@ _client: Optional[anthropic.Anthropic] = None
 
 # Claude Code 파일 모드 (API 키 없을 때 사용)
 _file_responses: Optional[dict] = None
-_current_row_id: str = ""
+# threading.local()로 스레드별 row_id 격리 — 전역 공유 시 병렬 처리에서 race condition 발생
+_thread_local = threading.local()
 
 
 def init_file_mode(responses: dict) -> None:
@@ -31,14 +33,14 @@ def init_file_mode(responses: dict) -> None:
 
 
 def set_current_row(row_id: str) -> None:
-    global _current_row_id
-    _current_row_id = str(row_id)
+    _thread_local.current_row_id = str(row_id)
 
 
 def _get_file_value(key: str):
-    if _file_responses is None or not _current_row_id:
+    row_id = getattr(_thread_local, "current_row_id", "")
+    if _file_responses is None or not row_id:
         return None
-    return _file_responses.get(_current_row_id, {}).get(key)
+    return _file_responses.get(row_id, {}).get(key)
 
 
 def get_client() -> anthropic.Anthropic:

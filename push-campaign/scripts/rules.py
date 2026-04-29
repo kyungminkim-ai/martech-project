@@ -132,6 +132,8 @@ def sanitize_title(raw: Optional[str]) -> str:
     cleaned = re.sub(r"[\n\r\t]", " ", raw)           # 실제 제어문자
     cleaned = re.sub(r"\\[nrt]", " ", cleaned)         # literal \n \r \t (2자 시퀀스)
     cleaned = re.sub(r"\s*\[[가-힣]+\]\s*", " ", cleaned)  # 순수 한글 대괄호 레이블
+    # 공백으로 감싸인 단독 X/× → lowercase x (콜라보 구분자; 브랜드명 내 비공백 X는 보존)
+    cleaned = re.sub(r"\s+[X×]\s+", " x ", cleaned)
     cleaned = re.sub(r" {2,}", " ", cleaned)
     return cleaned.strip()
 

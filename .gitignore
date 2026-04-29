@@ -34,6 +34,12 @@ match-push-agent-system/
 .env.local
 .env.*.local
 
+# Google 서비스 계정 키 (절대 커밋하지 않음)
+*-service-account*.json
+*service_account*.json
+gemini-project-*.json
+*-credentials.json
+
 # ──────────────────────────────────────────────────────
 # Python
 # ──────────────────────────────────────────────────────

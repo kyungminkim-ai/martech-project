@@ -13,14 +13,26 @@ LLM_MODEL = "claude-sonnet-4-6"
 LLM_MAX_TOKENS = 512
 LLM_MAX_RETRIES = 3
 
-# Databricks (Phase 2+ 연동 시 사용)
+# Databricks 연결 설정
 DATABRICKS_HOST      = os.getenv("DATABRICKS_HOST", "")
 DATABRICKS_HTTP_PATH = os.getenv("DATABRICKS_HTTP_PATH", "")
 DATABRICKS_TOKEN     = os.getenv("DATABRICKS_TOKEN", "")
+DATABRICKS_CONFIGURED = bool(DATABRICKS_HOST and DATABRICKS_HTTP_PATH and DATABRICKS_TOKEN)
 
-# Google Sheets (Phase 2+ 연동 시 사용)
-GOOGLE_SHEET_ID      = os.getenv("GOOGLE_SHEET_ID", "")
-GOOGLE_SHEET_CREDS   = os.getenv("GOOGLE_SHEET_CREDS_PATH", "")
+# Databricks SQL 쿼리 파일 경로
+BIZEST_SQL_PATH = BASE_DIR / "scripts" / "bizest_query.sql"
+
+# 데이터 소스 선택 종료 코드
+EXIT_DATABRICKS_UNAVAILABLE = 10  # Databricks 연결 실패 → 스킬 레이어가 fallback 처리
+
+# Google Sheets 연동
+GOOGLE_SHEET_ID                = os.getenv("GOOGLE_SHEET_ID", "")
+GOOGLE_SHEET_CREDS             = os.getenv("GOOGLE_SHEET_CREDS_PATH", "")
+GOOGLE_SHEET_GID               = int(os.getenv("GOOGLE_SHEET_GID", "0"))              # 선별 리포트 탭
+GOOGLE_SHEET_CAMPAIGN_GID      = int(os.getenv("GOOGLE_SHEET_CAMPAIGN_GID", "0"))     # 캠페인 메타 탭
+GOOGLE_SHEET_CAMPAIGN_META_GID = int(os.getenv("GOOGLE_SHEET_CAMPAIGN_META_GID",
+                                                "315655952"))                          # campaign_meta_sync 탭
+GOOGLE_SHEETS_ENABLED          = bool(GOOGLE_SHEET_ID and GOOGLE_SHEET_CREDS)
 
 # 소재 선별 설정
 MARKETING_TEAM_KEYWORDS = ["전사캠페인", "카테고리마케팅"]
@@ -61,6 +73,9 @@ CONFIDENCE_THRESHOLD = 3.0
 
 # 소재 선별 윈도우 (발송일로부터 N일 이내에 오픈된 소재만 선별)
 SEND_WINDOW_DAYS = 1
+
+# Pipeline 5 — 발송일 분배 설정
+MAX_PER_DATE = 5  # 날짜당 최대 소재 수 (초과 시 인접 날짜로 분배)
 
 # 선정 여부 컬럼명 (CSV 2행 헤더 로드 후 리네임된 이름)
 AD_STATUS_COLUMN = "ad_status"

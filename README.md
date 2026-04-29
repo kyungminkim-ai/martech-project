@@ -46,61 +46,83 @@ ANTHROPIC_API_KEY=sk-ant-...
 ### 전체 데이터 플로우
 
 ```
-📄 bizest_raw.csv          📄 brand_list.csv
-  ([앱푸시 발송 운영] 시트)       (브랜드 목록)
-         │                          │
-         └──────────┬───────────────┘
-                    ▼
-           [입력 검증 — 파일 존재 확인]
-                    │
-          ┌─────────▼──────────┐
-          │  Pipeline 1        │
-          │  소재 선별          │
-          │  (규칙 기반 필터링)  │
-          └─────────┬──────────┘
-                    │ 선별된 소재
-          ┌─────────▼──────────┐
-          │  Pipeline 2        │
-          │  메타데이터 생성     │
-          │  + LLM 메시지 생성  │
-          │  (Claude API)      │
-          └─────────┬──────────┘
-                    │
-          ┌─────────▼──────────┐
-          │  Pipeline 3        │
-          │  검수 검증 QA       │
-          │  (12개 항목 자동    │
-          │   검증)             │
-          └─────────┬──────────┘
-                    │
-          ┌─────────▼──────────┐
-          │  Pipeline 4        │
-          │  LLM Red Team      │
-          │  독립 재검토         │
-          └─────────┬──────────┘
-                    ▼
-     📊 campaign_meta_YYYYMMDD_HHmmss.csv
-       (캠페인메타엔진 운영 시트 형식)
-                    │
-                    ▼
-          👤 마케팅 담당자
-          [검수용] 컬럼 확인 후 Braze 등록
+  [Databricks SQL]          📄 brand_list.csv
+  bizest_query.sql               (브랜드 목록)
+       │ (source=auto/databricks)
+       │ 연결 실패 시
+       ▼
+  📄 bizest_raw.csv  ──────────────┐
+  (source=file fallback)           │
+                                   ▼
+                          [입력 검증 — 데이터 소스 결정]
+                                   │
+                    ┌──────────────▼─────────────┐
+                    │  Pipeline 1                 │
+                    │  소재 선별                   │
+                    │  (규칙 기반 필터링)           │
+                    │  + GSheets campaign_meta_sync│
+                    │    중복 판단                  │
+                    └──────────────┬──────────────┘
+                                   │ 선별된 소재
+                                   │  ↓ selection_report → Google Sheets 업로드
+                    ┌──────────────▼─────────────┐
+                    │  Pipeline 2                 │
+                    │  메타데이터 생성              │
+                    │  + LLM 메시지 생성           │
+                    │  (Claude API)               │
+                    └──────────────┬──────────────┘
+                                   │
+                    ┌──────────────▼─────────────┐
+                    │  Pipeline 3                 │
+                    │  검수 검증 QA               │
+                    │  (17개 항목 자동 검증)        │
+                    └──────────────┬──────────────┘
+                                   │
+                    ┌──────────────▼─────────────┐
+                    │  Pipeline 4                 │
+                    │  LLM Red Team               │
+                    │  독립 재검토                  │
+                    └──────────────┬──────────────┘
+                                   │
+                    ┌──────────────▼─────────────┐
+                    │  Pipeline 5                 │
+                    │  발송일 분배 (P5-A)           │
+                    │  + 광고코드 최종 할당 (P5-B)  │
+                    └──────────────┬──────────────┘
+                                   ▼
+          📊 campaign_meta_YYYYMMDD_HHmmss.csv
+            (캠페인메타엔진 운영 시트 형식)
+                                   │
+                                   ├──→ Google Sheets 자동 업로드
+                                   ▼
+                          👤 마케팅 담당자
+                          [검수용] 컬럼 확인 후 Braze 등록
 ```
 
 ---
 
 ### Pipeline 1 — 소재 선별
 
-비제스트 RAW(`bizest_raw.csv`)에서 발송 가능한 소재만 추출합니다.
+비제스트 RAW에서 발송 가능한 소재만 추출합니다.
+
+**일반 소재 선별 우선순위:**
 
 | 단계 | 조건 | 처리 |
 |------|------|------|
 | ① 취소 필터 | `remarks`에 `취소`, `CANCEL` 포함 | 제외 |
-| ② 중복 제거 | `landing_url + sourceBrandId + send_dt` 조합 중복 | id 오름차순 첫 번째만 유지 |
-| ③ 랜딩 오픈 검증 | `release_start_date_time < send_dt 11:00` 미충족 | 제외 |
-| ④ 마케팅팀 예외 | `register_team_name`에 `전사마케팅` 또는 `카테고리마케팅` 포함 | ③ 조건 무관하게 선별 |
+| ② 이미선정 제외 | 광고진행 계열 상태 (`source=file` 모드 전용) | 제외 |
+| ③ 캠메엔 중복 | `campaign_meta_sync`에 등록된 `landing_url` | CAMPAIGN_META_REGISTERED 코드로 탈락 |
+| ④ 기간내 중복 | 동일 실행 내 id/URL 중복 (기간·주간 배치 전용) | 제외 |
+| ⑤ 시트 당일 중복 | `landing_url + sourceBrandId + send_dt` 조합 | 제외 |
+| ⑥ 발송 윈도우 | `release_start_date_time` ≥ `send_dt 11:00` | 제외 |
+| ⑦ 랜딩 URL 검증 | musinsa.com 도메인, https, 유효한 ID | 제외 |
 
-중간 결과: `push-campaign/data/pipeline1_output_YYYYMMDD.csv`
+**전사캠페인 전용 로직** (`register_team_name`에 `전사캠페인` 포함):
+- ① 취소 조건만 적용 후, `landing_url + send_dt` 조합이 `campaign_meta_sync`에 없으면 무조건 선별
+- 발송 윈도우·URL 검증 등 나머지 조건 모두 생략
+
+중간 결과: `push-campaign/data/pipeline1_output_YYYYMMDD.csv`  
+선별 리포트: `push-campaign/output/selection_report_*.csv` → Google Sheets 자동 업로드
 
 ---
 
@@ -115,8 +137,8 @@ ANTHROPIC_API_KEY=sk-ant-...
 | `send_dt` | `--date` 인수 또는 내일 날짜 자동 사용 |
 | `send_time` | 고정 `11:00` |
 | `target` | 팀명 기반 성별 (여성팀→`여성`, 남성팀→`남성`, 그 외→`전체`) |
-| `priority` | 전사마케팅→`1`, 카테고리마케팅→`2`, 그 외→`3` |
-| `ad_code` | `APSCMCD` + BASE36 순번 (이전 코드에서 +1 자동 채번) |
+| `priority` | 전사캠페인→`1`, 카테고리마케팅→`2`, 그 외→`3` |
+| `ad_code` | `APSCMCD` + BASE36 순번 (P5에서 최종 재할당) |
 | `content_type` | URL 패턴: `/campaign/`→`캠페인`, `/content/`→`콘텐츠` |
 | `brand_id` | `sourceBrandId` 직접 복사 |
 | `push_url` | `landing_url?utm_source=app_push&utm_medium=cr&utm_campaign={ad_code}` |
@@ -170,9 +192,28 @@ ANTHROPIC_API_KEY=sk-ant-...
 
 ---
 
-### AI 미적용 — 마케터 직접 조작 영역
+### Pipeline 5 — 발송일 분배 & 광고코드 최종 할당
 
-AI 자동 생성 범위에서 의도적으로 제외된 패턴. 마케터가 직접 관리.
+P1~P4 완료 후 실행되는 후처리 파이프라인.
+
+**P5-A: 발송일 분배**
+
+날짜별 소재 밀집도를 분석하고 기준(`MAX_PER_DATE=5`) 초과 시 낮은 우선순위 소재를 인접 날짜로 재배치합니다.
+
+- 이동 우선순위: `priority` 숫자가 큰 소재(낮은 우선순위)부터 대상
+- 인접 날짜 중 여유 있고 동일 `brand_id`가 없는 날짜로 이동
+- 이동 불가 시 `needs_review=True` + `validation_notes` 기록
+
+**P5-B: 광고코드 최종 할당**
+
+`campaign_meta_sync.csv`와 `ad_code_seed.txt` 기준으로 마지막 `ad_code` 이후부터 순차 재할당.
+
+- 정렬: `send_dt ASC → priority ASC → id ASC`
+- `push_url`의 `utm_campaign`/`utm_source` 파라미터도 함께 갱신
+
+---
+
+### AI 미적용 — 마케터 직접 조작 영역
 
 | 항목 | 내용 |
 |------|------|
@@ -197,7 +238,7 @@ push-campaign/output/selection_report_{from}_{to}.csv
 | `send_time` | 발송 시각 (고정 11:00) | ✅ |
 | `target` | 발송 대상 (여성/남성/전체) | ✅ |
 | `priority` | 우선순위 (1/2/3) | ✅ |
-| `ad_code` | 광고 코드 (APSCMCD + BASE36) | ✅ |
+| `ad_code` | 광고 코드 (APSCMCD + BASE36) | ✅ P5 |
 | `content_type` | 콘텐츠 유형 (캠페인/콘텐츠) | ✅ |
 | `brand_id` | 브랜드 ID | ✅ |
 | `title` | 푸시 제목 (15~40자) | ✅ LLM |
@@ -214,16 +255,37 @@ push-campaign/output/selection_report_{from}_{to}.csv
 
 ## 실행 방법
 
-### 1. 입력 파일 준비
+### 1. 환경 변수 설정
+
+```bash
+# push-campaign/.env
+ANTHROPIC_API_KEY=sk-ant-...
+
+# Databricks (선택 — 설정 시 bizest_raw.csv 자동 수집)
+DATABRICKS_HOST=adb-xxxx.azuredatabricks.net
+DATABRICKS_HTTP_PATH=/sql/1.0/warehouses/xxxx
+DATABRICKS_TOKEN=dapi...
+
+# Google Sheets (선택 — 설정 시 선별 리포트 / 캠페인 메타 자동 업로드)
+GOOGLE_SHEET_ID=1FrE7ZIXiYuJEsMvFw_JTNedmYojNOW0xLv8courdr38
+GOOGLE_SHEET_GID=1466233062           # 선별 리포트 탭
+GOOGLE_SHEET_CAMPAIGN_GID=0           # 캠페인 메타 탭
+GOOGLE_SHEET_CAMPAIGN_META_GID=315655952  # campaign_meta_sync 탭
+GOOGLE_SHEET_CREDS_PATH=/path/to/service_account.json
+```
+
+### 2. 입력 파일 준비
 
 ```
 push-campaign/input/
-├── bizest_raw.csv          # 비제스트 RAW (필수)
 ├── brand_list.csv          # 브랜드 목록 (필수)
-└── category_selector.csv   # 카테고리 코드 (선택)
+├── category_selector.csv   # 카테고리 코드 (선택)
+└── bizest_raw.csv          # Databricks 미연동 시 필수
 ```
 
-### 2. Claude Code에서 실행
+`campaign_meta_sync.csv`는 Google Sheets 연동 시 자동 로드, 미연동 시 `input/campaign_meta_sync.csv` 파일 사용.
+
+### 3. Claude Code에서 실행
 
 단일 날짜:
 
@@ -239,11 +301,25 @@ push-campaign/input/
 /push-campaign-range 다음 주
 ```
 
+기존 selection_report에서 P2~5 재실행 (P1 생략):
+
+```
+/push-campaign --from-selection-report output/selection_report_20260427_20260507.csv
+```
+
 > **range 모드는 날짜 간 중복 소재를 자동 제거한다.** 동일 URL/소재가 여러 날짜에 걸쳐 이중 발송되는 것을 방지하기 위해 기간 실행은 반드시 range 모드(`--from`/`--to`)를 사용한다.
 
 날짜 미지정 시 내일 날짜가 자동 적용됩니다.
 
-### 3. 실행 결과 예시
+### 4. 데이터 소스 선택 (`--source`)
+
+| 값 | 동작 |
+|----|------|
+| `auto` (기본) | Databricks 연결 시도 → 실패(종료코드 10) 시 스킬이 파일 fallback 확인 |
+| `databricks` | Databricks 강제 사용 (환경변수 미설정 시 오류) |
+| `file` | `bizest_raw.csv` 직접 사용 |
+
+### 5. 실행 결과 예시
 
 단일 날짜:
 
@@ -334,11 +410,17 @@ martech-project/
     │   ├── settings.json              # 에이전트 Claude Code 권한
     │   └── skills/push-campaign/      # /push-campaign 스킬
     │       └── SKILL.md
-    ├── scripts/                       # 4-phase pipeline Python 구현
+    ├── scripts/                       # 5-phase pipeline Python 구현
     │   ├── run.py                     # 메인 실행 진입점
-    │   ├── pipeline1.py ~ pipeline4.py
+    │   ├── pipeline1.py               # 소재 선별
+    │   ├── pipeline2.py               # 메타데이터 & LLM 메시지 생성
+    │   ├── pipeline3.py               # 검수 검증 + 자동 수정
+    │   ├── pipeline4.py               # LLM Red Team 검토
+    │   ├── pipeline5.py               # 발송일 분배 + 광고코드 최종 할당
+    │   ├── gsheets.py                 # Google Sheets 연동
+    │   ├── bizest_query.sql           # Databricks 비제스트 조회 쿼리
     │   ├── config.py / rules.py / prompts.py / llm_client.py
-    │   └── run_logger.py / regenerate_v3.py
+    │   └── run_logger.py
     ├── references/                    # 정책 문서
     │   ├── selection_policy.md        # 소재 선별 기준
     │   ├── message_policy.md          # 메시지 생성 규칙
@@ -346,7 +428,7 @@ martech-project/
     │   ├── classification_policy.md   # 분류 규칙
     │   └── brand_guidelines.md        # 무신사 V&T, 금칙어
     ├── docs/                          # 문서
-    │   ├── flow_overview.md           # 시스템 플로우 상세 (이 문서의 원본)
+    │   ├── flow_overview.md           # 시스템 플로우 상세
     │   └── improvement_backlog.md     # 개선 백로그
     ├── input/                         # 입력 파일 (gitignored)
     ├── output/                        # 생성된 캠페인 CSV (gitignored)
@@ -364,11 +446,13 @@ Phase 1 (완료)   push-campaign 운영
                   goods_id 자동 추출
                   Pipeline 2 체크포인트
 
-Phase 1.5        H-3 이미지 URL 유효성 검사
-                  Databricks 연동 — 비제스트 RAW 자동 수집
+Phase 1.5 (완료) Databricks 연동 — 비제스트 RAW 자동 수집
+                  Google Sheets 연동 — 선별 리포트 / 캠페인 메타 자동 업로드
+                  Pipeline 5 — 발송일 분배 + 광고코드 최종 할당
+                  --from-selection-report 재실행 모드
+                  전사캠페인 전용 선별 로직
 
-Phase 2          Google Spreadsheet 연동
-                  Slack 검수 알림
+Phase 2          Slack 검수 알림
                   이메일·SMS 캠페인 추가
 
 Phase 3          성과 데이터 피드백 루프 (Databricks RAG)
@@ -380,5 +464,5 @@ Phase 3          성과 데이터 피드백 루프 (Databricks RAG)
 
 ## 신규 캠페인 추가
 
-`push-campaign/`을 참고 구현으로 삼아 동일한 디렉터리 구조와 4-phase pipeline을 따른다.
+`push-campaign/`을 참고 구현으로 삼아 동일한 디렉터리 구조와 5-phase pipeline을 따른다.
 추가 시 루트 `CLAUDE.md` 라우팅 테이블과 이 파일의 에이전트 현황 표를 업데이트한다.
