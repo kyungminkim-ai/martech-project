@@ -23,7 +23,8 @@ _TITLE_SYSTEM = """\
 제목은 **정체성**(브랜드·콜라보·상품명) 또는 **훅 문구**(호기심 유발 감성 문장) 중 하나로 씁니다.
 
 올바른 예:
-- "알리스 x 오정규" ← 정체성 (콜라보 쌍만)
+- "알리스 x 오정규" ← 정체성 (콜라보 쌍만, x 형식)
+- "서브웨이 with DAY6" ← 정체성 (콜라보 쌍만, with 형식 — 원본이 with를 쓴 경우)
 - "더마토리 x 톡신 공동개발 블랙세럼" ← 정체성 (콜라보 + 상품명)
 - "빵처럼 맛있는 쉐이크 발견" ← 훅 문구 (정체성 없이)
 
@@ -76,13 +77,15 @@ def build_title_prompt(
     nature_hint = _build_title_nature_hint(content_nature, benefit_type)
 
     if collab_pair:
-        parts = re.split(r'\s*[Xx×]\s*', collab_pair)
-        left, right = parts[0].strip(), parts[-1].strip()
+        m = re.match(r'^(.+?)\s+(?:[Xx×]|with)\s+(.+)$', collab_pair.strip())
+        left  = m.group(1).strip() if m else collab_pair
+        right = m.group(2).strip() if m else ""
         collab_section = f"""
 
 ## ⚠️ 콜라보 소재 — 제목 필수 규칙
 이 소재는 **{collab_pair}** 콜라보입니다.
 제목에 두 이름 **{left}** 와 **{right}** 를 모두 포함하세요.
+구분자 형식은 **반드시 원본 그대로** 유지하세요 (x는 소문자 x, with는 소문자 with).
 
 ✅ 올바른 예:
 - "{collab_pair}"
@@ -90,7 +93,8 @@ def build_title_prompt(
 
 ❌ 절대 금지:
 - 한쪽만: "{right} 발매"  ← {left} 누락
-- 행동어 혼합: "{collab_pair} 발매"  ← 발매/출시/단독은 본문의 몫"""
+- 행동어 혼합: "{collab_pair} 발매"  ← 발매/출시/단독은 본문의 몫
+- 구분자 변경: x ↔ with 혼용 금지"""
     else:
         collab_section = ""
 
@@ -121,6 +125,7 @@ _CONTENT_SYSTEM = """\
 
 ## 올바른 예시
 - 제목: "알리스 x 오정규"  →  본문: "(광고) 무신사 단독 한정 발매"
+- 제목: "서브웨이 with DAY6"  →  본문: "(광고) 무신사 단독 콜라보 발매"
 - 제목: "더마토리 x 톡신 공동개발 블랙세럼"  →  본문: "(광고) 4/27~29 단 3일 선론칭"
 - 제목: "에스에스알엘 x 현진 무신사 에디션"  →  본문: "(광고) 최대 31% 할인 + 쿠폰 + 사은품 혜택"
 - 제목: "빵처럼 맛있는 쉐이크 발견"  →  본문: "(광고) 테이크핏 브레드밀 단독 출시"
@@ -189,8 +194,8 @@ def build_content_prompt(
 
     collab_section = ""
     if collab_pair:
-        parts = re.split(r'\s*[Xx×]\s*', collab_pair)
-        names = " · ".join(p.strip() for p in parts)
+        m = re.match(r'^(.+?)\s+(?:[Xx×]|with)\s+(.+)$', collab_pair.strip())
+        names = f"{m.group(1).strip()} · {m.group(2).strip()}" if m else collab_pair
         collab_section = (
             f'\n\n## ⚠️ 콜라보 소재 — 본문 중복 금지\n'
             f'제목이 이미 "{collab_pair}" 콜라보를 표시합니다.\n'

@@ -13,7 +13,7 @@ from config import (
     AD_CODE_PREFIX, CONFIDENCE_THRESHOLD,
     CONTENTS_MIN_LEN, CONTENTS_MAX_LEN,
 )
-from rules import lookup_brand_names, extract_title_keywords, append_unsubscribe, detect_collab_pair
+from rules import lookup_brand_names, extract_title_keywords, append_unsubscribe, detect_collab_pair, _split_collab_pair
 
 logger = logging.getLogger(__name__)
 
@@ -48,9 +48,8 @@ def _check_title_body_overlap(title: str, body: str, collab_pair: str = "") -> b
     body_lower = body.lower()
 
     if collab_pair:
-        # 콜라보 쌍 자체가 본문에 통째로 반복되면 위반
-        pair_flat = collab_pair.lower().replace(" x ", "").replace(" × ", "")
-        parts = [p.strip().lower() for p in re.split(r'\s*[Xx×]\s*', collab_pair) if p.strip()]
+        left, right = _split_collab_pair(collab_pair)
+        parts = [p.strip().lower() for p in [left, right] if p.strip()]
         # 쌍이 통째로 나타나면 위반
         if re.search(re.escape(collab_pair.lower()), body_lower):
             return True
@@ -58,7 +57,7 @@ def _check_title_body_overlap(title: str, body: str, collab_pair: str = "") -> b
         matched = sum(1 for p in parts if p in body_lower)
         return matched >= 2
 
-    words = [w for w in re.split(r'[\s,·×xX\-]', title) if len(w) >= 3]
+    words = [w for w in re.split(r'[\s,·×\-]', title) if len(w) >= 3]
     if len(words) < 2:
         return False
     matches = sum(1 for w in words if w.lower() in body_lower)
@@ -220,6 +219,8 @@ def _check_row(row: pd.Series, seen_ad_codes: set, brand_df: Optional[pd.DataFra
     # ── 19. 콜라보 제목 구분자 대소문자 검사 ────────────────────────────
     if re.search(r'\s[X×]\s', title):
         issues.append("collab_separator_not_lowercase_x")
+    if re.search(r'\s[Ww][Ii][Tt][Hh]\s', title) and ' with ' not in title:
+        issues.append("collab_separator_with_not_lowercase")
 
     # ── 17. 할인율 정합성 검증 ───────────────────────────────────────────
     promotion_content = str(row.get("promotion_content", "") or "")

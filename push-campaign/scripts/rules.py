@@ -149,6 +149,8 @@ def sanitize_title(raw: Optional[str]) -> str:
     cleaned = re.sub(r"\s*\[[가-힣]+\]\s*", " ", cleaned)  # 순수 한글 대괄호 레이블
     # 공백으로 감싸인 단독 X/× → lowercase x (콜라보 구분자; 브랜드명 내 비공백 X는 보존)
     cleaned = re.sub(r"\s+[X×]\s+", " x ", cleaned)
+    # 공백으로 감싸인 With/WITH → lowercase with (콜라보 구분자 대소문자 정규화)
+    cleaned = re.sub(r"\s+[Ww][Ii][Tt][Hh]\s+", " with ", cleaned)
     cleaned = re.sub(r" {2,}", " ", cleaned)
     return cleaned.strip()
 
@@ -364,35 +366,75 @@ def build_webhook_contents(contents: str) -> str:
     return (contents or "").replace("\n", "\\n")
 
 
-_COLLAB_RE = re.compile(r'([가-힣]{2,})\s*[Xx×]\s*([가-힣]{2,})')
+# x/×/X 구분자: 한글+영문+혼용 지원, x는 반드시 공백으로 감싸야 감지 (브랜드명 내 x 오탐 방지)
+_COLLAB_RE = re.compile(
+    r'((?:[가-힣A-Za-z0-9]+(?:\s[가-힣A-Za-z0-9]+)*))\s+[Xx×]\s+((?:[가-힣A-Za-z0-9]+(?:\s[가-힣A-Za-z0-9]+)*))'
+)
+# with 구분자: sanitize_title()이 with를 소문자로 정규화한 이후에 적용
+_WITH_RE = re.compile(
+    r'((?:[가-힣A-Za-z0-9]+(?:\s[가-힣A-Za-z0-9]+)*))\s+with\s+((?:[가-힣A-Za-z0-9]+(?:\s[가-힣A-Za-z0-9]+)*))'
+)
+# 브랜드명 뒤에 붙는 마케팅 수식어 — 콜라보 쌍 추출 시 제거 대상
+_COLLAB_NOISE_RE = re.compile(
+    r'(?:^|\s)(?:무신사|선발매|한정발매|단독발매|발매|출시|선론칭|론칭|단독|에디션|콜라보|공동개발|한정|팝업)(?=\s|$)'
+)
+
+
+def _trim_collab_brand(brand: str) -> str:
+    """브랜드명 뒤에 붙은 마케팅 수식어를 제거하고 순수 브랜드명만 반환."""
+    m = _COLLAB_NOISE_RE.search(brand)
+    if m:
+        trimmed = brand[:m.start()].strip()
+        return trimmed if trimmed else brand
+    return brand
 
 
 def detect_collab_pair(event_name: str, main_title: str = "") -> str:
-    """이벤트명/메인타이틀에서 '브랜드A X 브랜드B' 콜라보 쌍을 추출해 정규화된 문자열로 반환.
+    """이벤트명/메인타이틀에서 콜라보 쌍을 추출해 구분자를 보존한 문자열로 반환.
+
+    x 패턴 우선 감지 후 없으면 with 패턴 시도. with는 event_name/main_title에만 적용
+    (promotion_content는 일반 문구 오탐 방지를 위해 제외).
     감지되지 않으면 빈 문자열 반환.
     """
     for text in (event_name or "", main_title or ""):
         m = _COLLAB_RE.search(text)
         if m:
-            left  = m.group(1).strip()
-            right = m.group(2).strip()
+            left = _trim_collab_brand(m.group(1).strip())
+            right = _trim_collab_brand(m.group(2).strip())
             if len(left) >= 2 and len(right) >= 2:
                 return f"{left} x {right}"
+    for text in (event_name or "", main_title or ""):
+        m = _WITH_RE.search(text)
+        if m:
+            left = _trim_collab_brand(m.group(1).strip())
+            right = _trim_collab_brand(m.group(2).strip())
+            if len(left) >= 2 and len(right) >= 2:
+                return f"{left} with {right}"
     return ""
+
+
+def _split_collab_pair(collab_pair: str) -> tuple:
+    """(left, right) 추출 — x/×/X/with 구분자 무관."""
+    m = re.match(r'^(.+?)\s+(?:[Xx×]|with)\s+(.+)$', (collab_pair or "").strip())
+    return (m.group(1).strip(), m.group(2).strip()) if m else (collab_pair or "", "")
 
 
 def title_has_collab_pair(title: str, collab_pair: str) -> bool:
     """title이 collab_pair의 두 브랜드명을 모두 포함하는지 확인."""
     if not collab_pair:
         return True
-    parts = [p.strip() for p in re.split(r'\s*[Xx×]\s*', collab_pair) if p.strip()]
+    left, right = _split_collab_pair(collab_pair)
+    parts = [p for p in [left, right] if p]
     title_flat = (title or "").replace(" ", "")
     return all(p.replace(" ", "") in title_flat for p in parts)
 
 
 def _normalize_collab_str(text: str) -> str:
-    """콜라보 exact-match 비교용 정규화: 공백 제거, X/× → x 소문자 변환."""
-    return re.sub(r'\s', '', (text or "")).replace('X', 'x').replace('×', 'x')
+    """콜라보 exact-match 비교용 정규화: 공백 제거, X/× → x, With/WITH → with."""
+    text = re.sub(r'\s', '', (text or ""))
+    text = text.replace('X', 'x').replace('×', 'x')
+    text = re.sub(r'[Ww][Ii][Tt][Hh]', 'with', text)
+    return text
 
 
 def title_is_clean_collab_pair(title: str, collab_pair: str) -> bool:
@@ -411,10 +453,11 @@ def extract_title_keywords(title: str, collab_pair: str = "") -> list:
     """제목에서 3자 이상 토큰을 추출해 content 프롬프트의 금지 단어 목록으로 사용.
     collab_pair가 있으면 개별 브랜드명도 추가한다.
     """
-    tokens = re.split(r'[\s,·×xX\-]', title or "")
-    keywords = [t for t in tokens if len(t) >= 3]
+    tokens = re.split(r'[\s,·×\-]', title or "")
+    keywords = [t for t in tokens if len(t) >= 3 and t.lower() not in ("with", "and")]
     if collab_pair:
-        for part in collab_pair.split(" X "):
+        left, right = _split_collab_pair(collab_pair)
+        for part in [left, right]:
             part = part.strip()
             if len(part) >= 2 and part not in keywords:
                 keywords.append(part)
@@ -434,9 +477,14 @@ def detect_content_nature(
     """소재 성격 분류: 콜라보레이션 / 단독선발매 / 신규발매 / 프로모션 / 기타.
 
     collab_pair가 이미 감지된 경우 최우선으로 콜라보레이션 반환.
+    x/with 패턴 없이 "콜라보" 키워드만 있는 경우도 콜라보레이션으로 분류.
     이후 키워드 우선순위: 단독선발매 > 신규발매 > 프로모션 > 기타.
     """
     if collab_pair:
+        return "콜라보레이션"
+
+    title_event = " ".join([event_name or "", main_title or ""]).lower()
+    if any(kw in title_event for kw in ["콜라보", "콜라보레이션", "collab"]):
         return "콜라보레이션"
 
     text = " ".join([event_name or "", promotion_content or "", main_title or ""]).lower()

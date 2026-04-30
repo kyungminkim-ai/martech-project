@@ -244,7 +244,16 @@ def apply_selection(
                 "rejection_detail": None,
             })
 
-    return pd.concat([df, pd.DataFrame(results, index=df.index)], axis=1)
+    result_cols = pd.DataFrame(
+        results if results else {
+            "selected": pd.Series(dtype=bool),
+            "selection_reason": pd.Series(dtype=object),
+            "rejection_reason": pd.Series(dtype=object),
+            "rejection_detail": pd.Series(dtype=object),
+        },
+        index=df.index,
+    )
+    return pd.concat([df, result_cols], axis=1)
 
 
 def run_pipeline1(
