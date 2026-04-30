@@ -27,7 +27,7 @@ from config import (
     DATABRICKS_CONFIGURED, DATABRICKS_HOST, DATABRICKS_HTTP_PATH, DATABRICKS_TOKEN,
     BIZEST_SQL_PATH, EXIT_DATABRICKS_UNAVAILABLE,
     GOOGLE_SHEET_ID, GOOGLE_SHEET_CREDS, GOOGLE_SHEET_GID, GOOGLE_SHEET_CAMPAIGN_GID,
-    GOOGLE_SHEETS_ENABLED,
+    GOOGLE_SHEET_BIZEST_GID, GOOGLE_SHEETS_ENABLED,
 )
 from gsheets import upload_to_sheet as _gsheets_upload
 from pipeline1 import load_campaign_meta_sync, run_pipeline1
@@ -324,6 +324,14 @@ def _upload_campaign_meta_to_gsheets(df: pd.DataFrame) -> None:
             out[col] = ""
     _gsheets_upload(df=out[OUTPUT_COLUMNS], spreadsheet_id=GOOGLE_SHEET_ID,
                     sheet_gid=GOOGLE_SHEET_CAMPAIGN_GID, creds_path=GOOGLE_SHEET_CREDS)
+
+
+def _upload_bizest_raw_to_gsheets(df: pd.DataFrame) -> None:
+    """Databricks에서 조회한 bizest_raw를 Google Sheets(gid=578734437)에 전체 덮어쓰기."""
+    if not GOOGLE_SHEETS_ENABLED:
+        return
+    _gsheets_upload(df=df, spreadsheet_id=GOOGLE_SHEET_ID,
+                    sheet_gid=GOOGLE_SHEET_BIZEST_GID, creds_path=GOOGLE_SHEET_CREDS)
 
 
 def save_weekly_report(all_candidates: list, week_start: str) -> Path:
@@ -708,6 +716,7 @@ def run_range(
         date_from_ext = (datetime.strptime(date_from, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
         raw_df_base = _fetch_bizest_from_databricks(date_from_ext, date_to)
         logger.info(f"Databricks 조회 범위: {date_from_ext} ~ {date_to} ({len(raw_df_base)}건)")
+        _upload_bizest_raw_to_gsheets(raw_df_base)
 
     # 파일/Databricks 공통: send_dt를 release_start_date_time 기반으로 행별 계산
     raw_df_base = _add_computed_send_dt(raw_df_base)
@@ -1049,6 +1058,7 @@ def main():
     if databricks_mode:
         # date_from-1 ~ date_from 범위로 조회해 send_dt 계산 후 필터
         raw_df_all = _fetch_bizest_from_databricks(send_dt_minus_1, send_dt)
+        _upload_bizest_raw_to_gsheets(raw_df_all)
         raw_df_all = _add_computed_send_dt(raw_df_all)
         raw_df = raw_df_all[raw_df_all["send_dt"] == send_dt].copy()
         _, brand_df, category_df = load_inputs(raw_path, brand_path, source="file")

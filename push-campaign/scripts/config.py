@@ -32,6 +32,8 @@ GOOGLE_SHEET_GID               = int(os.getenv("GOOGLE_SHEET_GID", "0"))        
 GOOGLE_SHEET_CAMPAIGN_GID      = int(os.getenv("GOOGLE_SHEET_CAMPAIGN_GID", "0"))     # 캠페인 메타 탭
 GOOGLE_SHEET_CAMPAIGN_META_GID = int(os.getenv("GOOGLE_SHEET_CAMPAIGN_META_GID",
                                                 "315655952"))                          # campaign_meta_sync 탭
+GOOGLE_SHEET_BIZEST_GID        = int(os.getenv("GOOGLE_SHEET_BIZEST_GID",
+                                                "578734437"))                          # bizest_raw 탭
 GOOGLE_SHEETS_ENABLED          = bool(GOOGLE_SHEET_ID and GOOGLE_SHEET_CREDS)
 
 # 소재 선별 설정
